@@ -11,9 +11,10 @@ So the drift check is the missing protection, and it has to cover both hops
 that exist:
 
 1. **core checkout → container**  (``~/Documents/odysseus`` → ``/app``)
-2. **w2a checkout → core checkout** (``~/Documents/odysseus-w2a`` →
-   ``~/Documents/odysseus``) — the extension exists in two places and has
-   silently diverged before.
+2. **w2a → core checkout** (``~/Documents/odysseus-w2a/extensions`` →
+   ``~/Documents/odysseus/extensions``) — the extension exists in two places
+   and has silently diverged before.
+3. **bundled → installed** (``odysseus/extensions`` → ``odysseus/data/extensions``)
 
 Only files this workstream actually touches are checked. That is
 deliberate: checking all of ``src/`` would report drift from every unrelated
@@ -218,6 +219,36 @@ def main() -> int:
                 print(f"  {GREEN}copied{RESET} {rel}")
         else:
             print(f"  {GREEN}ok{RESET}    {rel}")
+
+    # ── Hop 3: bundled → installed copy ──────────────────────────────────
+    # The third copy. Discovery prefers bundled over data/, so this one does
+    # not decide what runs, but it is where each extension's ``data_path``
+    # lives and what a reinstall diffs against. It sat at 9/out, pre-analyzer,
+    # for the whole session: not wrong, just quietly irrelevant until the day
+    # someone reinstalls from it.
+    print(f"{DIM}extension: bundled → installed copy{RESET}")
+    installed = os.path.join(
+        os.path.dirname(CORE_ROOT), "odysseus", "data", "extensions",
+        "whats2api_bridge",
+    )
+    if not os.path.isdir(installed):
+        print(f"  {YELLOW}skip{RESET}  no installed copy at {installed}")
+    else:
+        for rel in EXT_FILES:
+            mine = _sha256(os.path.join(ext_dst, rel))
+            theirs = _sha256(os.path.join(installed, rel))
+            if mine is None or theirs is None or mine != theirs:
+                failures.append(f"installed/{rel}")
+                print(f"  {RED}DRIFT{RESET} {rel}")
+                if args.deploy:
+                    import shutil
+                    os.makedirs(os.path.dirname(os.path.join(installed, rel)),
+                                exist_ok=True)
+                    shutil.copy2(os.path.join(ext_dst, rel),
+                                 os.path.join(installed, rel))
+                    print(f"  {GREEN}copied{RESET} {rel}")
+            else:
+                print(f"  {GREEN}ok{RESET}    {rel}")
 
     # ── Hop 1: core checkout → container ────────────────────────────────
     if not _container_running():

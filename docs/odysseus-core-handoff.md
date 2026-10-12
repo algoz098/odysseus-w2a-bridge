@@ -388,6 +388,85 @@ docker logs odysseus-odysseus-1 --since 1m | grep -iE "request_authority|DROPPED
 
 ---
 
+# Addendum (2026-10-12) — três achados novos, já corrigidos em `dev`
+
+Os quatro findings acima continuam válidos. Estes três apareceram depois,
+também pelo formato de tráfego "extension desatendida rodando sozinha", e
+**já estão corrigidos e commitados** em `~/Documents/odysseus` (branch `dev`).
+Estão aqui porque os três são bugs de core que qualquer usuário do Odysseus
+pode ter, e porque um deles é uma falha de segurança.
+
+## Finding 5 — Allowlist de crew não cobre tools `mcp__*`  ← **corrigido**
+
+- **Onde:** `src/task_scheduler.py`, `_execute_llm_task`
+- **Por quê:** o `disabled_tools` era derivado invertendo `enabled_tools` do
+  crew sobre `BUILTIN_TOOL_DESCRIPTIONS.keys()`. Esse dict **não contém
+  nenhum nome `mcp__*`**, então a inversão era no-op para tools MCP — enquanto
+  o scheduler *forçava a incluir* (`always_include`) justamente as `mcp__*`
+  listadas pelo crew. Tinham a metade "include" da fórmula e não a metade
+  "deny".
+- **Consequência observada:** um run real cujo crew existe para **impedir**
+  escrita no WhatsApp recebeu essas tools no schema. O `agent-routing-audit`
+  mostrou 21 tools da bridge oferta, incluindo `send_message`, `call_method`,
+  `send_media`, `mark_read` e o ciclo de vida de conexões — recuperadas
+  semanticamente pelo RAG a partir de um prompt sobre conversas de WhatsApp,
+  e nada as removia de novo. A única coisa entre aquele run e uma mensagem
+  para o chat do próprio operador era uma frase no prompt dizendo
+  `NEVER call send_message`.
+- **Fix:** `crew_disabled_tools()` inverte também sobre o inventário vivo de
+  tools MCP. `compose_task_relevant_tools` já subtrai o conjunto de negação,
+  então as tools nunca chegam a `relevant_tools` nem ao schema.
+- **Opt-in por intenção:** a inversão MCP só roda quando o allowlist do crew
+  **já nomeia** alguma tool `mcp__*`. Um crew que nunca menciona MCP fica
+  exatamente como estava — senão todo crew com allowlist passaria a perder
+  silenciosamente as tools de que dependia.
+- **Modos de falha:** todos falham para "disponibilidade", exceto o que não
+  pode. Inventário MCP ilegível → nenhuma negação (em vez de inversão
+  errada); allowlist vazio/malformado → nada desabilitado.
+- **Teste:** `tests/test_crew_allowlist_mcp_tools.py` (5 checks).
+- **Verificado ao vivo:** o mesmo run que antes via 21 tools da bridge agora
+  vê exatamente as 5 que o crew lista.
+
+## Finding 6 — Sentinel de sessão in-process é truthy  ← **corrigido**
+
+- **Onde:** `src/mcp_manager.py`, `call_tool`
+- **Por quê:** tools in-process são registradas com um sentinel
+  `_INPROC_SESSION = object()` em `self._sessions`. Ele é *truthy*, então um
+  nome de tool que **não** está em `_in_process_tools` caía no caminho de
+  sessão e chamava `session.call_tool(...)` num `object()` puro.
+- **Consequência:** `'object' object has no attribute 'call_tool'` — um
+  `AttributeError` interno do manager escondendo a causa real (a extension
+  não registrou a tool). Essa mensagem é o que mascarou o Finding A-5 do
+  handoff (onze tools de transporte que nunca existiram) por semanas.
+- **Fix:** erro nomeando server, tool e a causa.
+
+## Finding 7 — Envelope de erro do plugin perdia os campos extras  ← **corrigido**
+
+- **Onde:** `src/mcp_manager.py`, `_format_in_process_result`
+- **Por quê:** com `{"error": ...}` no dict, o formatador devolvia só
+  `{"error", "exit_code"}`.
+- **Consequência:** o envelope que o SPEC da extension define (`status_code`
+  e `body`, que distinguem "o upstream me rejeitou" de "eu falhei") era
+  descartado, junto com qualquer marcador machine-readable que a extension
+  anexasse (`blocked_by`). Um handler que funcionava corretamente ainda
+  expunha uma string crua.
+- **Fix:** preserva as chaves extras do envelope; `ok` fica de fora porque é
+  marcador interno e concorre com `exit_code`.
+
+---
+
+## Estimativa — addendum
+
+| Finding | Severidade | Estado | Esforço |
+|---|---|---|---|
+| 5 — allowlist não cobre `mcp__*` | **alta** (segurança) | corrigido | feito |
+| 6 — sentinel truthy | média (diagnóstico) | corrigido | feito |
+| 7 — envelope de erro truncado | baixa (contrato) | corrigido | feito |
+
+Commits: `493b8161` (finding 5), `82ebcab9` (findings 6 e 7).
+
+---
+
 ## Estimativa de impacto
 
 | Finding | Severidade | Esforço estimado | Quem toca |

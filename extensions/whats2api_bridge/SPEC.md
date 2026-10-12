@@ -291,18 +291,59 @@ scoped to the `whats2api_bridge__` prefix (OXS storage wall).
 
 ## 8. Testing
 
-`tests/test_extension_events_whats2api_bridge.py` exercises:
+`test_extension_whats2api_bridge.py` (repo root) exercises:
 
 - Manifest validation (id, capabilities, schema, hashes).
 - Discovery + enable + disable cycle.
-- 16 MCP tools registered with correct schemas.
+- All 21 MCP tools registered: the 16 of §4.1/§4.2 plus the 5 local
+  reads. Asserted by name, not by count, and split by `read_only` —
+  the transport half must stay undeclared so the approval gate fails high
+  on it. A bare count went stale while the transport half did not exist.
 - Inbound webhook: parses `messages.upsert`, persists rows in
   `messages` + `events`, fires the OXS event.
 - Invalid `whats2api` header: persists but does NOT fire OXS events.
 - Rate limit: 11th call in 1 s returns 429.
 - `call_method` and `send_message` return friendly errors when neither
   arg nor default connection_id is set.
+- Every messaging tool maps to the right `POST /connections/request`
+  RPC, and rejects incomplete args *before* touching the network.
+- `health` answers when the provider is unreachable instead of raising.
+- A successful `send_message` fires `whats2api.message.sent` (§5.3).
+- The Conversation Analyzer is refused all 16 transport tools, and can
+  still use the 5 reads. Enforced per handler — see §9.
 
-A real whats2api account is not required — the tests only verify the
-local bridge; the REST client is exercised via `monkeypatch` on
-`httpx.AsyncClient`.
+A real whats2api account is not required: the REST client is exercised
+through an `httpx.MockTransport` installed on the loaded plugin's client
+builder.
+
+**Test isolation is mandatory, not hygiene.** `SettingsNamespace.set()`
+persists synchronously to `data/oxs/permissions/whats2api_bridge.json`,
+and `docker-compose.yml` bind-mounts that same directory into the
+container. A test that writes a setting rewrites the operator's live
+credential in the running container, and stays green while doing it —
+that already cost a real `api_token`. `conftest.py` at the repo root
+redirects `DATABASE_URL`, `OXS_PERMISSIONS_DIR` and
+`DATA_EXTENSIONS_DIR` to a temp tree; `W2A_TEST_LIVE_STATE=1` is the
+explicit opt-out for investigating an on-box incident.
+
+---
+
+## 9. The analyzer's read-only-over-WhatsApp rule
+
+The analyzer persists findings to Odysseus artifacts and never writes
+back to a chat. Two independent mechanisms enforce it, and both are
+required because neither covers the other's gaps:
+
+1. **Core (primary).** The crew's `enabled_tools` allowlist inverts into
+   a deny set that covers `mcp__*` tools, so unlisted transport tools
+   never reach the agent's schema. Opt-in by intent: it applies only to
+   crews whose allowlist names at least one `mcp__*` tool.
+2. **Per-handler (defence in depth).** Every transport tool calls
+   `_refuse_if_analyzer()`, which refuses when the caller's
+   `RequestAuthority` session is the analyzer's task session — and
+   refuses when it *cannot tell*, because an empty lookup result means
+   "nobody" and would allow the write.
+
+Write tool refusals carry `blocked_by: analyzer_read_only_policy`, or
+`blocked_by: analyzer_lookup_unavailable` for the fail-closed case, so a
+refusal is machine-classifiable from the MCP result.
