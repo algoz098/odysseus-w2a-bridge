@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -46,6 +47,10 @@ CONNECTIONS = [
 ]
 
 
+ACCOUNT_EMAIL = "operator@example.com"
+ACCOUNT_PASSWORD = "hunter2"
+
+
 class _StubState:
     """Shared between the handler and the test."""
 
@@ -55,6 +60,16 @@ class _StubState:
         self.force_status: int | None = None      # next response is this
         self.force_body: str | None = None
         self.hang: bool = False
+        # whats2api mints a JWT here and rejects anything else on the REST
+        # surface with `jwt malformed` -- the exact behaviour that made
+        # the MCP token look like a valid credential right up until it did
+        # not. Reproduced so the test fails the same way the real API does.
+        self.jwt_issued = 0
+        self.live_jwts: set = set()
+        self.reject_next_jwt = False
+        # Applies to every response until cleared, so a retry can be tested
+        # against a provider that keeps saying no.
+        self.persistent_status: int | None = None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -106,6 +121,40 @@ class _Handler(BaseHTTPRequestHandler):
 
         path = self.path.split("?")[0]
         parts = [p for p in path.split("/") if p]
+
+        # persistent_status models a provider that keeps refusing *business*
+        # calls; the login must still work or the retry path is untestable.
+        if self.state.persistent_status is not None and path != "/authentication":
+            self._send(self.state.persistent_status, {},
+                       raw=self.state.force_body or "{}")
+            return
+
+        # POST /authentication -> the daily JWT
+        if method == "POST" and path == "/authentication":
+            if ((body or {}).get("email") != ACCOUNT_EMAIL
+                    or (body or {}).get("password") != ACCOUNT_PASSWORD
+                    or (body or {}).get("strategy") != "local"):
+                self._send(401, {"name": "NotAuthenticated",
+                                 "message": "Invalid login", "code": 401})
+                return
+            self.state.jwt_issued += 1
+            token = f"stub-jwt-{self.state.jwt_issued}"
+            self.state.live_jwts.add(token)
+            self._send(200, {"accessToken": token, "user": {"email": ACCOUNT_EMAIL}})
+            return
+
+        # Everything below the fold is JWT-only.
+        auth = self.headers.get("Authorization") or ""
+        bearer = auth[7:] if auth.startswith("Bearer ") else ""
+        if bearer not in self.state.live_jwts:
+            self._send(401, {"name": "NotAuthenticated",
+                             "message": "jwt malformed", "code": 401,
+                             "className": "not-authenticated",
+                             "data": {"name": "JsonWebTokenError"}})
+            return
+        if self.state.reject_next_jwt:
+            self.state.reject_next_jwt = False
+            self.state.live_jwts.discard(bearer)
 
         # POST /connections/request
         if method == "POST" and path == "/connections/request":
@@ -202,6 +251,10 @@ def bridge(stub):
     leaves ``default_connection_id`` behind and every later test inherits it
     — which is how the first draft of this file reported two product bugs
     that did not exist. Reset the settings this file touches.
+
+    Auth goes through the account credentials, because that is the only
+    thing the real REST surface accepts: handing it the MCP token returns
+    ``401 jwt malformed``. The MCP-token fallback has its own test below.
     """
     init_db()
     registry = ExtensionRegistry()
@@ -209,16 +262,26 @@ def bridge(stub):
     running = registry.enable("whats2api_bridge")
     assert running.enabled, running.host.violations
     ns = running.host.get_settings()
-    for key in ("base_url", "api_token", "default_connection_id",
-                "request_timeout_seconds"):
+    for key in ("base_url", "api_token", "api_email", "api_password",
+                "default_connection_id", "request_timeout_seconds"):
         try:
             ns.set(key, None)
         except Exception:
             pass
     ns.set("base_url", stub.url)
-    ns.set("api_token", "stub-token")
+    ns.set("api_email", ACCOUNT_EMAIL)
+    ns.set("api_password", ACCOUNT_PASSWORD)
     ns.set("request_timeout_seconds", 30)
+    _reset_jwt_cache()
     return running
+
+
+def _reset_jwt_cache():
+    """The JWT cache is module-global; a stale one points at a dead stub."""
+    for name in list(sys.modules):
+        mod = sys.modules.get(name)
+        if name.startswith("_oxs_whats2api_bridge_plugin") and mod is not None:
+            mod._JWT_CACHE.update({"token": "", "at": 0.0})
 
 
 def call(tool: str, args: dict | None = None):
@@ -241,10 +304,38 @@ def test_list_connections_over_real_http(bridge, stub):
 
     req = stub.requests[-1]
     assert (req["method"], req["path"]) == ("GET", "/connections")
-    # The real client must actually authenticate. A mocked transport never
-    # sees this, and a missing/renamed auth header is invisible until the
-    # provider answers 401 in production.
-    assert req["headers"]["authorization"] == "Bearer stub-token"
+    # The real client must actually authenticate, and with the JWT the
+    # provider actually accepts -- not the stored MCP token, which the real
+    # API answers with `jwt malformed`. A mocked transport never sees the
+    # header at all, so a wrong one here is invisible until production.
+    auth = req["headers"]["authorization"]
+    assert auth.startswith("Bearer stub-jwt-"), auth
+    # ...and it had to mint it first.
+    assert any(r["path"] == "/authentication" for r in stub.requests), \
+        "the first REST call must exchange the credentials for a JWT"
+
+
+def test_mcp_token_alone_is_rejected_like_the_real_api(bridge, stub):
+    """The MCP token is valid — on the other door.
+
+    whats2api issues a long-lived MCP token for /mcp/<token> and a daily
+    JWT for the REST surface. Handing the REST surface the MCP token gets
+    ``401 jwt malformed``, which is exactly what happened with a real
+    credential. Pinned so the fallback path can never look like it works.
+    """
+    ns = bridge.host.get_settings()
+    ns.set("api_email", None)
+    ns.set("api_password", None)
+    ns.set("api_token", "an-mcp-token")
+    _reset_jwt_cache()
+
+    result = call("list_connections")
+    assert result["exit_code"] == 1
+    assert "401" in result["error"], result
+    # The provider's own words must survive to the caller.
+    assert "jwt malformed" in (result.get("body") or ""), result
+    # ...and nothing may have been minted on the way.
+    assert not any(r["path"] == "/authentication" for r in stub.requests)
 
 
 def test_get_connection(bridge, stub):
@@ -359,23 +450,60 @@ def test_missing_connection_id_never_reaches_the_wire(bridge, stub):
 
 
 def test_upstream_401_keeps_its_status_and_body(bridge, stub):
-    """C-10: the error envelope must not be flattened to a bare string."""
-    stub.force_status = 401
+    """C-10: the error envelope must not be flattened to a bare string.
+
+    The stub refuses persistently, so this also covers the retry: the client
+    re-mints once, still gets refused, and then the caller's error must
+    carry the provider's own status and body rather than an empty string.
+    """
+    call("list_connections")                 # prime a valid JWT first
+    stub.persistent_status = 401
     stub.force_body = json.dumps({"code": 401, "message": "jwt malformed"})
-    result = call("list_connections")
+    try:
+        result = call("list_connections")
+    finally:
+        stub.persistent_status = None
     assert result["exit_code"] == 1
     assert "HTTP 401" in result["error"]
     assert result.get("status_code") == 401, result
     assert "jwt malformed" in (result.get("body") or ""), result
+    # One retry, not a loop.
+    assert sum(1 for r in stub.requests if r["path"] == "/authentication") == 2, \
+        "expected exactly one re-mint after the first rejection"
 
 
 def test_upstream_500_is_reported_not_swallowed(bridge, stub):
+    call("list_connections")                 # prime a valid JWT first
     stub.force_status = 500
     stub.force_body = "upstream exploded"
     result = call("list_connections")
     assert result["exit_code"] == 1
     assert "HTTP 500" in result["error"]
     assert "upstream exploded" in (result.get("body") or "")
+    # A 500 is not an auth failure, so it must not burn a re-mint.
+    assert sum(1 for r in stub.requests if r["path"] == "/authentication") == 1
+
+
+def test_login_failure_is_reported_with_the_providers_reason(bridge, stub):
+    """A bad password must say so, not surface as a downstream 401."""
+    bridge.host.get_settings().set("api_password", "wrong-password")
+    _reset_jwt_cache()
+    result = call("list_connections")
+    assert result["exit_code"] == 1
+    assert "rejected the login" in result["error"], result
+    assert "401" in result["error"], result
+
+
+def test_no_credential_at_all_fails_before_the_wire(bridge, stub):
+    ns = bridge.host.get_settings()
+    ns.set("api_email", None)
+    ns.set("api_password", None)
+    ns.set("api_token", "")
+    _reset_jwt_cache()
+    result = call("list_connections")
+    assert result["exit_code"] == 1
+    assert "no api credential" in result["error"].lower(), result
+    assert stub.requests == [], "no HTTP call may be attempted without a credential"
 
 
 def test_unknown_connection_is_a_404_not_a_crash(bridge, stub):
@@ -384,13 +512,17 @@ def test_unknown_connection_is_a_404_not_a_crash(bridge, stub):
     assert "404" in result["error"]
 
 
+def _dead_port() -> int:
+    """A port nothing is listening on."""
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def test_provider_unreachable_is_a_friendly_error(bridge, stub):
     """A dead provider must not surface as an unhandled exception."""
-    import socket
-    with socket.socket() as s:                   # grab a port, then free it
-        s.bind(("127.0.0.1", 0))
-        dead_port = s.getsockname()[1]
-    bridge.host.get_settings().set("base_url", f"http://127.0.0.1:{dead_port}")
+    bridge.host.get_settings().set("base_url", f"http://127.0.0.1:{_dead_port()}")
     result = call("list_connections")
     assert result["exit_code"] == 1
     assert "network error" in result["error"].lower(), result
@@ -398,11 +530,7 @@ def test_provider_unreachable_is_a_friendly_error(bridge, stub):
 
 
 def test_health_survives_an_unreachable_provider(bridge, stub):
-    import socket
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        dead_port = s.getsockname()[1]
-    bridge.host.get_settings().set("base_url", f"http://127.0.0.1:{dead_port}")
+    bridge.host.get_settings().set("base_url", f"http://127.0.0.1:{_dead_port()}")
     result = call("health")
     assert result["exit_code"] == 0, "health answers, it does not raise"
     data = result["output"]["data"]
@@ -415,12 +543,5 @@ def test_client_timeout_is_honoured(bridge, stub):
     stub.hang = True
     result = call("list_connections")
     assert result["exit_code"] == 1
-    assert "network error" in result["error"].lower() or "timeout" in str(result).lower()
-
-
-def test_missing_api_token_fails_before_the_wire(bridge, stub):
-    bridge.host.get_settings().set("api_token", "")
-    result = call("list_connections")
-    assert result["exit_code"] == 1
-    assert "api_token is not configured" in result["error"]
-    assert stub.requests == []
+    assert ("network error" in result["error"].lower()
+            or "timeout" in str(result).lower()), result
