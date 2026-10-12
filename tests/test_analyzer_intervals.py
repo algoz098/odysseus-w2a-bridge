@@ -454,13 +454,16 @@ def test_adoption_marks_sealed_analyzed_and_runs_once():
     t0 = now - 3 * GAP
     storage.insert("messages", connection_id="x", direction="in",
                    **_msg("old", t0))
-    n = mod._adopt_existing_intervals(storage, now=now, gap_seconds=GAP)
+    n = mod._adopt_existing_intervals(
+        storage, now=now, gap_seconds=GAP, tracking_since=now,
+    )
     if n != 1:
         _fail(f"adoption must mark the sealed interval analyzed: {n}")
     rows = mod._load_interval_rows(storage)
     if rows[0]["status"] != "analyzed":
         _fail(f"adopted row must be analyzed: {rows}")
-    if mod._adopt_existing_intervals(storage, now=now, gap_seconds=GAP) != 0:
+    if mod._adopt_existing_intervals(
+            storage, now=now, gap_seconds=GAP, tracking_since=now) != 0:
         _fail("adoption must be a one-shot (state table no longer empty)")
     _info("adoption marks pre-existing sealed content analyzed (once)")
 
@@ -470,7 +473,9 @@ def test_adoption_keeps_unsealed_groups():
     now = 10**10
     storage.insert("messages", connection_id="x", direction="in",
                    **_msg("fresh", now - 60))
-    n = mod._adopt_existing_intervals(storage, now=now, gap_seconds=GAP)
+    n = mod._adopt_existing_intervals(
+        storage, now=now, gap_seconds=GAP, tracking_since=now,
+    )
     if n != 0:
         _fail(f"unsealed group must not be adopted: {n}")
     msgs = mod._fetch_window_messages(storage, 0)
@@ -478,6 +483,68 @@ def test_adoption_keeps_unsealed_groups():
     if new:
         _fail(f"unsealed group must stay out of the queue until sealed: {new}")
     _info("adoption leaves recent (unsealed) groups for the first real run")
+
+
+def test_adoption_never_seals_content_that_arrived_after_tracking_started():
+    """The silent-loss case the E2E hit on a live container.
+
+    Adoption used to key only on "the state table is empty", which it read
+    as "nothing has ever been tracked". A fresh container therefore sealed
+    every message already in the window as
+    ``adopted: pre-intervalization content`` — including one that had just
+    arrived — and the analyzer saw an empty queue with no error anywhere.
+    """
+    storage = _storage()
+    now = 10**10
+    tracked_since = now - 4 * GAP
+    # One settled message on each side of the boundary, on distinct chats.
+    storage.insert("messages", connection_id="x", direction="in",
+                   **_msg("pre@s.whatsapp.net", now - 5 * GAP))
+    storage.insert("messages", connection_id="x", direction="in",
+                   **_msg("post@s.whatsapp.net", now - 3 * GAP))
+
+    n = mod._adopt_existing_intervals(
+        storage, now=now, gap_seconds=GAP, tracking_since=tracked_since,
+    )
+    if n != 1:
+        _fail(f"only pre-tracking content may be adopted: {n}")
+
+    adopted = mod._load_interval_rows(storage)
+    chats = sorted(r.get("chat_jid") for r in adopted)
+    if chats != ["pre@s.whatsapp.net"]:
+        _fail(f"adoption must touch only the pre-tracking chat: {chats}")
+
+    msgs = mod._fetch_window_messages(storage, 0)
+    new, _ = mod.compute_analysis_queue(msgs, adopted, now=now, gap_seconds=GAP)
+    chats = sorted(iv["chat_jid"] for iv in new)
+    if chats != ["post@s.whatsapp.net"]:
+        _fail(
+            "post-tracking content must still be offered to the analyzer; "
+            f"got {chats}"
+        )
+    _info("adoption seals only what predates interval tracking")
+
+
+def test_adoption_refuses_to_run_without_a_boundary():
+    """No boundary recorded → skip adoption rather than guess.
+
+    An unbounded adoption can only lose data; a skipped one is re-offered to
+    the model, which is recoverable. Failing open here is the bug.
+    """
+    storage = _storage()
+    now = 10**10
+    storage.insert("messages", connection_id="x", direction="in",
+                   **_msg("anything", now - 5 * GAP))
+    n = mod._adopt_existing_intervals(storage, now=now, gap_seconds=GAP)
+    if n != 0:
+        _fail(f"adoption without a boundary must not seal anything: {n}")
+    if mod._load_interval_rows(storage):
+        _fail("adoption without a boundary must leave the table empty")
+    msgs = mod._fetch_window_messages(storage, 0)
+    new, _ = mod.compute_analysis_queue(msgs, [], now=now, gap_seconds=GAP)
+    if len(new) != 1:
+        _fail(f"content must stay available instead of being sealed: {new}")
+    _info("adoption without a tracking boundary seals nothing")
 
 
 ALL_TESTS = [
@@ -509,6 +576,8 @@ ALL_TESTS = [
     test_failed_run_cycle_requeues,
     test_adoption_marks_sealed_analyzed_and_runs_once,
     test_adoption_keeps_unsealed_groups,
+    test_adoption_never_seals_content_that_arrived_after_tracking_started,
+    test_adoption_refuses_to_run_without_a_boundary,
 ]
 
 

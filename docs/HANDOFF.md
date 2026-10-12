@@ -1,9 +1,18 @@
 # Handoff — `whats2api_bridge` / Conversation Analyzer
 
-**Data:** 2026-10-12
+**Data:** 2026-10-12 (revisão 2)
 **Para:** próxima equipe nesta extension + no core
-**Estado:** ciclo de análise validado ponta a ponta · ciclo de transporte **não** validado
-**Última bateria:** smoke ✅ · 28 intervalos ✅ · 5 soak ✅ · E2E ✅ · 20/20 runs live ✅
+**Estado:** ciclo de análise **e** ciclo de transporte validados ponta a ponta
+**Última bateria:** transporte 52/52 ✅ · manifesto/AST/sync ✅ · 30 intervalos ✅
+· 5 soak ✅ · E2E ✅ · restart ✅ · sync repo→container ✅
+
+> **Ação do operador pendente.** A suíte antiga escrevia no estado vivo e
+> deixou `api_token: "fake"` e o token do webhook inbound igual a `"token"`
+> (5 caracteres) em `data/oxs/permissions/whats2api_bridge.json`, que é
+> bind-mount para o container. Ver **A-7**. Antes de confiar em qualquer
+> tráfego WhatsApp real: reintroduza o token da API e reconfigure a URL do
+> webhook em whats2api.com. Nada aqui pode ser corrigido por código — são
+> credenciais que o teste sobrescreveu.
 
 ---
 
@@ -18,13 +27,14 @@ coberto por testes ponta a ponta.
 
 ### Objetivo atual
 
-O ciclo de **análise** está validado. O ciclo de **transporte** não está. Três
-correções feitas no core do Odysseus ainda vivem em `dev` e precisam subir.
-O maior risco residual não é código — é o **deploy manual**.
+Os dois ciclos — análise e transporte — estão validados e publicados no
+container. O core subiu. O que resta é operação (§5 P3/P4) e a rotação de
+credencial acima.
 
 ### Não-objetivos (importante para não perder tempo)
 
-- A extensão **nunca** responde WhatsApp. Não é bug, é o produto.
+- O **Analyzer** nunca responde WhatsApp. Não é bug, é o produto — e agora é
+  **verificado em runtime**, não só escrito no prompt (ver invariante 7).
 - Não é multi-tenant. Escopo é do operador.
 - O provedor é `api.whats2api.com`; a extensão não implementa protocolo
   WhatsApp, ela fala HTTP com um serviço.
@@ -35,8 +45,8 @@ O maior risco residual não é código — é o **deploy manual**.
 
 Dois papéis que não devem ser confundidos:
 
-- **A ponte** é *transporte*: conectividade WhatsApp → Odysseus. Entra mensagem,
-  sai evento. Não interpreta nada.
+- **A ponte** é *transporte*: conectividade WhatsApp ↔ Odysseus. 16 tools
+  outbound (SPEC §4.1/§4.2) + 5 tools locais de leitura. Não interpreta nada.
 - **O Analyzer** é *produto*: conversa → artefato nativo. Não transporta nada.
 
 O ponto onde se tocam é a tabela `whats2api_bridge__messages`.
@@ -56,17 +66,68 @@ Estes são os que definem se a extensão funciona. Cada um tem teste:
    harness. Se ela depender do modelo obedecer, não é determinístico.
 6. **Idempotência** — rodar duas vezes não produz o dobro; rodar depois de
    falha não perde nada.
+7. **O Analyzer é read-only sobre WhatsApp** — cada tool de transporte
+   consulta `_refuse_if_analyzer()` e recusa a chamada vinda da sessão do
+   Analyzer. Isto **não** pode ser derivado de allowlist de crew: ver C-8,
+   onde o Analyzer foi *oferecido* `send_message` ao vivo.
 
 ---
 
 ## 3. Achados no CORE do Odysseus
 
-**Sete defeitos. Todos corrigidos, todos com teste de regressão.**
+**Dez defeitos. Todos corrigidos, todos com teste de regressão.**
 
 O padrão: **nenhum aparece em conversa interativa.** Todos aparecem quando o
 cliente é uma extension rodando *desatendida, com prompt-manifesto, de forma
 recurrente*. Se a próxima equipe achar estranho o core ceder tanto, o motivo é
 esse — é a primeira classe de tráfego real desse formato.
+
+### C-8 — Allowlist de crew não cobre tools `mcp__*`  ← **o mais importante**
+
+- **Onde:** `src/task_scheduler.py`, `_execute_llm_task`
+- **Por quê:** `disabled_tools` é derivado invertendo `enabled_tools` do crew
+  sobre `BUILTIN_TOOL_DESCRIPTIONS.keys()`. Esse dict **não contém nenhum
+  nome `mcp__*`**. Logo o crew do Analyzer — cujo allowlist existe
+  precisamente para impedir escrita no WhatsApp — não bloqueia nada.
+  O scheduler tem o outro meio da fórmula: `always_include` força-inclui os
+  `mcp__*` que o crew **lista**. O "deny" para os que ele não lista não existe.
+- **Consequência:** comprovado ao vivo, no log de um run real às 17:00 — o
+  Analyzer recebeu no schema `send_message`, `call_method`, `send_media`,
+  `mark_read`, `send_presence`, `send_reaction`, `create_connection`,
+  `remove_connection`, `start_connection`, `stop_connection`. A frase
+  "NEVER call send_message" no prompt era a única coisa entre o Analyzer e
+  uma mensagem para o seu chefe.
+- **Mitigação aplicada:** o enforcement foi para dentro da extension
+  (`_refuse_if_analyzer`, teste `test_analyzer_is_refused_every_transport_tool`).
+- **Por que não corrigi no core:** fechar a metade que falta muda a
+  semântica de *todo* crew com `enabled_tools` — todos os MCP tools não
+  listados passam a sumir. É a leitura correta de "allowlist", mas é uma
+  mudança de produto que precisa de decisão do time de core. Ver P4.
+
+### C-9 — `_INPROC_SESSION` é truthy e vaza para o dispatch
+
+- **Onde:** `src/mcp_manager.py`, `call_tool`
+- **Por quê:** tools in-process são registradas com um sentinel
+  `_INPROC_SESSION = object()` em `self._sessions`. Ele é *truthy*, então um
+  nome de tool que **não** está em `_in_process_tools` caía no caminho de
+  sessão e chamava `session.call_tool(...)` num `object()`.
+- **Consequência:** `'object' object has no attribute 'call_tool'` — erro
+  interno do manager escondendo a causa real (a extension não registrou a
+  tool). Foi exatamente a mensagem que mascarou A-5 por semanas.
+- **Fix:** devolve erro nomeando o server, a tool e a causa.
+- **Teste:** `test_send_message_requires_connection_id` (via A-5).
+
+### C-10 — Envelope de erro do plugin perdia os campos extras
+
+- **Onde:** `src/mcp_manager.py`, `_format_in_process_result`
+- **Por quê:** com `{"error": ...}` no dict, o formatador devolvia só
+  `{"error", "exit_code"}`. O SPEC §4.3 manda o envelope carregar
+  `status_code` e `body` (distinguir "o upstream me rejeitou" de "eu
+  falhei"), e extensions anexam marcadores próprios.
+- **Consequência:** um handler que funcionava corretamente ainda expunha uma
+  string crua;arkers machine-readable (`blocked_by`) sumiam.
+- **Fix:** preserva as chaves extras do envelope, sem `ok` (que é marcador
+  interno e concorre com `exit_code`).
 
 ### C-1 — Prompt de manifesto lido como pedido do usuário
 
@@ -152,10 +213,90 @@ esse — é a primeira classe de tráfego real desse formato.
 - **Fix:** `PRAGMA journal_mode=DELETE` (correto em FS de rede).
 - **Regra que sobrou:** **todo I/O de teste passa pela API HTTP. Nunca abrir o
   SQLite do container por fora.**
+  *Exceção consciente:* inspeção pontual de leitura com
+  `sqlite3.connect("file:...?mode=ro", uri=True)` é segura **com o
+  `journal_mode=DELETE` do C-7 no lugar** (não há WAL para checkpointar).
+  Verificar o PRAGMA antes de confiar nisso.
 
 ---
 
 ## 4. Achados na EXTENSÃO
+
+### A-7 — A suíte de testes escrevia no estado vivo do operador  ← **dano já feito**
+
+- **Onde:** `test_extension_whats2api_bridge.py` (sem isolamento) + ausência de `conftest.py`
+- **Por quê:** `SettingsNamespace.set()` persiste em disco, de forma
+  síncrona, em `data/oxs/permissions/<id>.json`. O teste escrevia
+  `api_token="fake"` e `default_connection_id="DEFAULT_CID"`; outro escrevia
+  `webhook_url_token="token"`. `./data` é bind-mount (`docker-compose.yml`:
+  `${APP_DATA_DIR:-./data}:/app/data`), então o estrago do host **chegou ao
+  container rodando** — o mesmo arquivo, literalmente.
+- **Consequência:** `api_token` real substituído por `"fake"` → todo outbound
+  dá HTTP 401. Token do webhook inbound virando a string de 5 caracteres
+  `"token"` → qualquer URL configurada em whats2api.com responde 404. E
+  ninguém percebia: a suíte continuava verde.
+- **Fix:** `conftest.py` na raiz do repo redireciona `DATABASE_URL`,
+  `OXS_PERMISSIONS_DIR` e `DATA_EXTENSIONS_DIR` para uma árvore temporária.
+  `W2A_TEST_LIVE_STATE=1` é o opt-out explícito, só para investigar incidente
+  em produção.
+- **Verificado:** com um sentinel plantado no arquivo de settings, a suíte
+  roda inteira sem tocá-lo.
+- **Pendente do operador:** reintroduzir o token real e reconfigurar a URL do
+  webhook. Não é corrigível por código.
+
+### A-6 — Adoption selava intervalos vivos  ← **perda silenciosa, bloqueou o E2E**
+
+- **Onde:** `plugin.py`, `_adopt_existing_intervals`
+- **Por quê:** a migração pré-intervalização rodava "enquanto a tabela de
+  estado estivesse vazia" e lia isso como "nunca houve rastreamento". Mas
+  tabela vazia também é o estado de um container novo, um data-dir apagado ou
+  um bump de schema — e então **tudo** que estivesse na janela era marcado
+  `analyzed` com o resumo `adopted: pre-intervalization content`, sem nunca
+  ter sido analisado.
+- **Consequência:** o E2E falhou 4/4 com "No new conversation intervals." A
+  tabela tinha exatamente uma linha, selando a mensagem que o teste tinha
+  acabado de semear. O mesmo mecanismo engole qualquer conversa que chegue
+  com `ts` antigo (clock skew, webhook reprocessado) — sem erro em lugar
+  nenhum.
+- **Fix, em duas partes:**
+  1. **Fronteira explícita** (`analyzer_tracking_since`, armada uma vez no
+     primeiro enable). Só mensagem *anterior* à fronteira pode ser adotada;
+     o resto é trabalho vivo.
+  2. **Opt-in** (`analyzer_adopt_existing`, default `False`, auto-limpa após
+     rodar). Adoption marca conteúdo como analisado sem ninguém ter
+     analisado — errar só pode perder dados; não rodar custa uma
+     re-offerência visível e recuperável.
+  - **Por que opt-in e não só a fronteira:** a fila só oferece intervalos
+    silenciosos há `gap_seconds` (45 min), então conteúdo testável é
+    necessariamente *backdated* em relação a qualquer fronteira de
+    wall-clock. Adoption automática e um E2E que semeia são
+    incompatíveis por construção.
+- **Teste:** `test_adoption_never_seals_content_that_arrived_after_tracking_started`,
+  `test_adoption_refuses_to_run_without_a_boundary` (28 → 30).
+
+### A-5 — Os 11 tools de transporte nunca existiram
+
+- **Onde:** `plugin.py`, loop de registro de MCP tools
+- **Por quê:** o loop iterava **só** `_read_tools(...)`. Não havia factory
+  para a família de transporte. `send_message`, `call_method`, `health` e o
+  ciclo de vida de conexções estavam no docstring do módulo, na tabela §4.1/4.2
+  do SPEC, na lista de tools proibidos do Analyzer — e em nenhum lugar como
+  código. Confirmei em **todos** os commits desde `1a39bb0c` e no backup
+  `.zip`: nunca foram registrados.
+- **Consequência:** o "papel de transporte" do produto não existia. Os 4
+  testes que o cobriam falhavam com `'object' object has no attribute
+  'call_tool'` (C-9) desde o primeiro commit — e foram reclassificados como
+  "expectations obsoletas". **Uma suíte cujas falhas são ruído conhecido
+  deixa de ser lida**; foi assim que a metade inteira do produto passou
+  semanas invisível.
+- **Fix:** `_transport_tools()` com as 16 tools do SPEC, funiladas por
+  `POST /connections/request {connectionId, method, params}`; registradas
+  com `read_only=False` (escrevem no WhatsApp — o gate de aprovação tem de
+  falhar alto), cada uma embrulhada em `_refuse_if_analyzer`.
+- **Teste:** 26 checks novos — mapa RPC por tool, rejeição de args
+  incompletos *antes* da rede, rota por operação de conexão, `health` que
+  responde em vez de explodir, evento `whats2api.message.sent`, e o guard do
+  Analyzer nos 16 tools. Suíte: 26 → 52.
 
 ### A-1 — `seal_claims` selava intervalo sem ter produzido nada  ← **grave**
 
@@ -209,48 +350,59 @@ esse — é a primeira classe de tráfego real desse formato.
 
 ## 5. O que falta — priorizado
 
-### P0 — Transporte sem cobertura (nosso, bloqueia dizer "validado")
+### P0 — Rotacionar as credenciais que a suíte sobrescreveu  ← **bloqueia tráfego real**
 
-`test_extension_whats2api_bridge.py` está em **19/26**. As 7 falhas são
-**expectativas obsoletas, não defeito de produto**:
+`data/oxs/permissions/whats2api_bridge.json` (bind-mount, container incluso)
+está com `api_token: "fake"` e `default_connection_id: "DEFAULT_CID"`, e o
+token do webhook inbound em disco é a string `"token"`. Ver A-7.
 
-- fixa versão `0.1.0` (hoje `0.5.2`)
-- espera `call_method` como primeira tool registrada (`get_analysis_queue` ordena primeiro)
-- confere conjunto exato de tools e tabelas — o Analyzer adicionou `whats2api_bridge__intervals`
+**O que fazer:** reintroduzir o token real da API em whats2api.com; apagar
+`data/extensions/whats2api_bridge/inbound_webhook_token` e reabilitar a
+extension para rotacionar o webhook; atualizar a URL em whats2api.com.
+Nenhuma mudança de código faz isso.
 
-**Por que é P0:** essa é a suíte que cobre `send_message`, `send_media`,
-`send_reaction`, `mark_read`, `send_presence`, `is_on_whatsapp`, `call_method`,
-ciclo de vida de conexões e o token do webhook. **Todo o papel de transporte está
-sem rede de segurança.** Mecânico, ~15 min.
+### P1 — ~~Cobertura de transporte~~ **feito**
 
-### P1 — Container pode estar servindo código velho
+A suíte de transporte cobre os 16 tools, o ciclo de vida, o guard do Analyzer e
+os envelopes de erro. 52/52. Era P0 na revisão anterior com a premissa errada
+de que os tools existiam e só faltava rede de segurança — ver A-5.
 
-**Por que é o maior risco residual:** o core **não é bind-mount**. `src/` é
-embutido na imagem; o deploy é `docker cp` + `restart` manual. Já aconteceu duas
-vezes nesta sessão: (a) o container rodando `agent_loop.py` pré-fix depois de um
-`restart` que eu achei que bastava; (b) a extensão morta por um patch que só
-existia no repo.
+### P2 — ~~Check repo→container~~ **feito** · `tests/test_deploy_sync.py`
 
-**O que fazer:** um check automático repo→container (hash dos 5 arquivos de core
-que alteramos + os 4 da extension). Hoje só existe o sync repo↔repo.
+O core não é bind-mount; `src/` é embutido na imagem e o deploy é
+`docker cp` + `restart`. Já aconteceu duas vezes nesta sessão. Agora há um
+check automático de hash nos dois hops que existem (w2a → core checkout → container),
+cobre os `file_hashes` do manifesto, e faz o deploy com `--deploy`.
 
-### P2 — Teste de restart
+```bash
+python3 tests/test_deploy_sync.py                  # reporta
+python3 tests/test_deploy_sync.py --rehash         # recalcula file_hashes
+python3 tests/test_deploy_sync.py --rehash --deploy # sincroniza e restarta
+```
 
-**Por que:** a extensão tem que auto-habilitar e reconciliar a task sozinha. Foi o
-que quebrou duas vezes e **não há teste**. Um `docker restart` + assert de
-`is_enabled` + `task.status == active` cobre.
+### P3 — ~~Teste de restart~~ **feito** · `tests/test_restart.py`
 
-### P3 — Soak em tempo real
-
-**Por que:** 20 runs em 14 min não é soak. O hang de 51 min só apareceu com horas
-de uptime. O soak determinístico (relógio virtual) cobre lógica; não cobre
-comportamento de provider real ao longo do tempo.
+`docker restart` e afirma: extension re-habilitada, task do Analyzer `active`,
+**mesmo token de webhook antes e depois** (a rotação silenciosa era o defeito
+mais caro e é invisível de dentro do app, porque o app aceita o token novo
+dele mesmo), `plugin.py` inalterado, storage legível.
 
 ### P4 — Levar os fixes de core para upstream
 
-**Por que:** C-1 a C-7 estão em `src/` no branch `dev` e afetam **qualquer**
-usuário do Odysseus, não só esta extension. Ficarem aqui é conhecimento
-perdido. Já documentados em `docs/odysseus-core-handoff.md` para o time de core.
+C-1 a C-10 estão em `src/` no branch `dev` e afetam **qualquer** usuário do
+Odysseus, não só esta extension. Ficarem aqui é conhecimento perdido.
+Documentados em `docs/odysseus-core-handoff.md` para o time de core.
+
+**C-8 precisa de decisão, não só de port.** Fechar a metade que falta do
+`disabled_tools` muda a semântica de todo crew com `enabled_tools`. Enquanto
+não houver decisão, a extension se defende sozinha — mas isso é defesa em
+profundidade, não a correção.
+
+### P5 — Soak em tempo real
+
+20 runs em 14 min não é soak. O hang de 51 min só apareceu com horas de
+uptime. O soak determinístico (relógio virtual) cobre lógica; não cobre
+comportamento de provider real ao longo do tempo. Bloqueado por P0.
 
 ---
 
@@ -267,6 +419,9 @@ perdido. Já documentados em `docs/odysseus-core-handoff.md` para o time de core
 - **Correção real (não feita):** entregar a fila no prompt em vez de depender da
   tool. Exige um hook de fire-time que a API de extensões **não tem hoje**
   (`register_task_action` não serve). É decisão de arquitetura, não bug.
+- **Nota:** os 4/4 "No new conversation intervals." que o E2Evia mostrar antes
+  da revisão 2 **não** eram este comportamento — eram o A-6 engolindo o
+  intervalo semeado. Distinga os dois antes de "confirmar" a taxa de 8%.
 
 ---
 
@@ -274,12 +429,28 @@ perdido. Já documentados em `docs/odysseus-core-handoff.md` para o time de core
 
 1. **SQLite do container: nunca abrir por fora.** Já trunca dados. Ver C-7.
 2. **OXS faz AST audit no enable.** Uma chamada proibida no plugin = extensão
-   morta, sem erro visível. Hoje `test_analyzer.py` roda o scanner do framework.
-3. **Core não é bind-mount.** `docker cp` + `restart`, sempre. Ver P1.
-4. **Duas cópias da extension.** `odysseus-w2a/extensions/…` (dev, onde as suítes
-   carregam) e `odysseus/extensions/…` (core, vai pro container). Já divergiram
-   uma vez. `test_analyzer.py` agora exige byte-idêntico.
+   morta, sem erro visível. `test_analyzer.py` roda o scanner do framework.
+3. **Core não é bind-mount.** `docker cp` + `restart`, sempre. Ver P2.
+4. **Três cópias da extension, e a discovery nem sempre escolhe a que você
+   editou.** `odysseus-w2a/extensions/…` (dev), `odysseus/extensions/…`
+   (bundled, tem prioridade na discovery) e
+   `odysseus/data/extensions/…` (instalada, `data_path`). As suítes carregam a
+   **bundled**. Editar a de dev e rodar os testes não muda nada — foi assim
+   que A-5 ficou invisível por um tempo. `test_analyzer.py` exige
+   byte-idêntico w2a↔core, e `test_deploy_sync.py` fecha o segundo hop.
 5. **WAL sobre FUSE trunca escritas.** Sintoma: rows que somem ou "regredem".
+   Corrigido em C-7 (`journal_mode=DELETE`).
+6. **Settings de extension persistem em disco a cada `set()`**, e o `data/`
+   é bind-mount do container. Um `settings.set()` num teste reescreve a
+   credencial do operador *no container rodando*. Foi o A-7. Números de porta
+   não são o problema — o diretório é o mesmo.
+7. **Allowlist de crew não alcança tools `mcp__*`.** Não confie nela para
+   conter escrita em WhatsApp. Ver C-8.
+8. **Uma falha que sempre acontece deixa de ser lida.** Os 4 testes de
+   transporte estavam vermelhos desde o primeiro commit e foram reclassificados
+   como "expectations obsoletas" — era a única evidência de que a metade do
+   produto não existia. Distinga "teste desatualizado" de "teste descrevendo
+   algo que nunca foi implementado", e escreva o motivo no teste.
 
 ---
 
@@ -289,27 +460,28 @@ perdido. Já documentados em `docs/odysseus-core-handoff.md` para o time de core
 export PYTHONPATH=~/Documents/odysseus          # obrigatório: suítes importam o core
 
 cd ~/Documents/odysseus-w2a
-python3 tests/test_analyzer.py                  # manifest, hashes, AST, sync
-python3 tests/test_analyzer_intervals.py        # 28 checks de fila
-python3 tests/test_analyzer_soak.py             # 5 checks, relógio virtual
-python3 -u tests/test_analyzer_e2e.py            # E2E contra o container live
-python3 -m pytest test_extension_whats2api_bridge.py -q   # transporte (19/26 — P0)
+python3 -m pytest test_extension_whats2api_bridge.py -q  # transporte, 52 checks
+python3 tests/test_analyzer.py                            # manifest, hashes, AST, sync
+python3 tests/test_analyzer_intervals.py                  # 30 checks de fila
+python3 tests/test_analyzer_soak.py                       # 5 checks, relógio virtual
+python3 -u tests/test_analyzer_e2e.py                     # E2E contra o container live
+python3 -u tests/test_restart.py                          # durabilidade de restart
+python3 tests/test_deploy_sync.py                         # drift repo → container
 ```
 
-**Deploy da extension:**
+**Deploy:**
 
 ```bash
-LOCAL=~/Documents/odysseus-w2a/extensions/whats2api_bridge
-docker exec odysseus-odysseus-1 rm -rf /app/extensions/whats2api_bridge/__pycache__
-docker cp "$LOCAL/plugin.py"      odysseus-odysseus-1:/app/extensions/whats2api_bridge/plugin.py
-docker cp "$LOCAL/extension.json" odysseus-odysseus-1:/app/extensions/whats2api_bridge/extension.json
-docker cp "$LOCAL/ui/index.html"  odysseus-odysseus-1:/app/extensions/whats2api_bridge/ui/index.html
-docker cp "$LOCAL/ui/script.js"   odysseus-odysseus-1:/app/extensions/whats2api_bridge/ui/script.js
-docker compose -f ~/Documents/odysseus/docker-compose.yml restart odysseus
+cd ~/Documents/odysseus-w2a
+python3 tests/test_deploy_sync.py --rehash --deploy
 ```
 
-**Depois de mexer em `extension.json`:** recalcular `file_hashes` — o smoke falha
-de propósito, mas o cache do navegador não.
+Cobre os dois hops (w2a → core checkout → container), recalcula
+`file_hashes` do manifesto e reinicia o serviço. `--rehash` sozinho é o que
+se usa depois de editar `plugin.py` ou `extension.json`.
+
+**Depois de mexer em `extension.json`:** `--rehash`. O smoke falha de
+propósito, mas o cache do navegador não.
 
 ---
 
@@ -323,3 +495,4 @@ de propósito, mas o cache do navegador não.
 | Spec da extension | `extensions/whats2api_bridge/SPEC.md` |
 | Estado vivo | `docs/STATUS.md` |
 | Handoff anterior (findings 1–7) | `docs/odysseus-core-handoff.md` |
+| Isolar testes do estado vivo | `conftest.py` · `W2A_TEST_LIVE_STATE=1` é o opt-out |

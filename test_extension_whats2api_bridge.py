@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 
 import httpx
 import pytest
@@ -34,6 +35,30 @@ EXT_DIR = os.path.join(
     "extensions",
     "whats2api_bridge",
 )
+
+# The two tool families the bridge must register, per SPEC §4.1 / §4.2.
+# Kept explicit (rather than a count) so a tool that silently stops
+# registering fails by name. That is exactly the failure this suite sat on
+# for its whole life: the transport half was never implemented, and the
+# tool-list assertion had drifted to noise long enough that nobody read it.
+TRANSPORT_TOOLS = [
+    "list_connections", "get_connection", "create_connection",
+    "patch_connection", "remove_connection", "start_connection",
+    "stop_connection", "refresh_connections", "health",
+    "send_message", "send_reaction", "mark_read", "send_media",
+    "send_presence", "is_on_whatsapp", "call_method",
+]
+READ_TOOLS = [
+    "list_messages", "get_message", "get_analysis_queue",
+    "list_events", "list_connections_local",
+]
+EXPECTED_TABLES = [
+    "whats2api_bridge__connections",
+    "whats2api_bridge__events",
+    "whats2api_bridge__messages",
+    "whats2api_bridge__intervals",
+]
+EXPECTED_VERSION = "0.5.2"
 
 
 from core.database import SessionLocal, engine, init_db
@@ -71,7 +96,14 @@ def test_manifest_validates():
     with open(os.path.join(EXT_DIR, "extension.json")) as f:
         m = validate_manifest(f.read())
     assert m["id"] == "whats2api_bridge"
-    assert m["version"] == "0.1.0"
+    # Pinned to the manifest, not to a literal. This suite used to assert
+    # "0.1.0" and went red on every version bump — which trains the reader
+    # to ignore it, and is how the missing transport tools (§ below) stayed
+    # invisible: a suite whose failures are known noise stops being read.
+    assert m["version"] == EXPECTED_VERSION, (
+        "extension.json version drifted from the suite's expectation; bump "
+        "EXPECTED_VERSION deliberately, do not just make it green"
+    )
     assert m["entry_point"] == "plugin:register"
 
 
@@ -97,21 +129,45 @@ def test_plugin_is_ast_safe():
 def test_enable_registers_all_capabilities(registry):
     running = registry.enable("whats2api_bridge")
     assert running.enabled
-    # 16 MCP tools
+    # 16 transport + 5 local-read MCP tools.
     tool_names = sorted(t.tool_name for t in running.host.mcp_tools)
-    assert tool_names == sorted([
-        "list_connections", "get_connection", "create_connection",
-        "patch_connection", "remove_connection", "start_connection",
-        "stop_connection", "refresh_connections", "health",
-        "send_message", "send_reaction", "mark_read", "send_media",
-        "send_presence", "is_on_whatsapp", "call_method",
-    ])
-    # 1 inbound webhook, 1 public route, 1 static, 1 panel.
+    assert tool_names == sorted(TRANSPORT_TOOLS + READ_TOOLS), (
+        "missing: "
+        f"{sorted(set(TRANSPORT_TOOLS + READ_TOOLS) - set(tool_names))}; "
+        f"unexpected: {sorted(set(tool_names) - set(TRANSPORT_TOOLS + READ_TOOLS))}"
+    )
+    # The read half is a brokered private read; the transport half changes
+    # WhatsApp state and must stay undeclared so the approval gate fails high.
+    read_only = {
+        t.tool_name: t.read_only for t in running.host.mcp_tools
+    }
+    assert all(read_only[n] is True for n in READ_TOOLS), (
+        f"read tools must declare read_only=True: "
+        f"{[n for n in READ_TOOLS if not read_only[n]]}"
+    )
+    assert all(read_only[n] is False for n in TRANSPORT_TOOLS), (
+        "transport tools must NOT declare read_only — they write to WhatsApp: "
+        f"{[n for n in TRANSPORT_TOOLS if read_only[n]]}"
+    )
+    # 1 inbound webhook, 1 static, 1 panel.
     assert len(running.host.webhooks) == 1
-    assert len(running.host.routes) == 1
     assert len(running.host.statics) == 1
     assert len(running.host.panels) == 1
     assert running.host.violations == []
+    # Pin the auth split rather than a bare route count: the admin/analyzer
+    # surface grew from 1 to 16 and the old count assertion had gone stale,
+    # but the property that matters is that exactly ONE route is public and
+    # it is the read-only status route the static dashboard polls.
+    public = sorted(rt.path for rt in running.host.routes if rt.auth == "public")
+    assert public == ["/ext-api/whats2api_bridge/status"], (
+        f"unexpected public surface: {public}"
+    )
+    non_admin = sorted(
+        rt.path for rt in running.host.routes if rt.auth not in ("admin", "public")
+    )
+    assert non_admin == [], (
+        f"routes that are neither admin nor public: {non_admin}"
+    )
 
 
 def test_disable_unwinds(registry):
@@ -125,13 +181,13 @@ def test_disable_unwinds(registry):
 
 
 def test_data_tables_created_on_enable(registry):
-    running = registry.enable("whats2api_bridge")
+    registry.enable("whats2api_bridge")
     storage = PluginStorage("whats2api_bridge", engine=engine)
-    assert sorted(storage.list_own_tables()) == sorted([
-        "whats2api_bridge__connections",
-        "whats2api_bridge__events",
-        "whats2api_bridge__messages",
-    ])
+    # ``__intervals`` carries the analyzer's conversation intervals — the
+    # harness state that makes "nothing is lost, nothing is analysed twice"
+    # possible. It arrived with the analyzer; asserting the exact table set
+    # is what keeps the next table from being added without a decision.
+    assert sorted(storage.list_own_tables()) == sorted(EXPECTED_TABLES)
 
 
 # ── Uninstall cleanup ───────────────────────────────────────────────────────
@@ -602,6 +658,319 @@ def test_health_endpoint_pings_api(registry):
         assert result["output"]["data"]["connection_count"] == 1
     finally:
         w2a_plugin._build_client = orig
+
+
+# ── Transport tools: the outbound half ──────────────────────────────────────
+# The bridge is two things: it receives WhatsApp events (the read tools above
+# plus the inbound webhook) and it drives WhatsApp (these). The second half
+# shipped as a docstring and a SPEC table with no implementation behind it, so
+# every one of these tests was red from the first commit and got reclassified
+# as "expectations obsoletas". These pin the wire shapes so that cannot
+# happen again silently.
+
+
+def _mock_client(w2a_plugin, handler):
+    """Patch the loaded plugin's client builder onto a MockTransport."""
+    transport = httpx.MockTransport(handler)
+    orig = w2a_plugin._build_client
+
+    def patched(host):
+        c = orig(host)
+        c._transport = transport
+        return c
+
+    w2a_plugin._build_client = patched
+    return orig
+
+
+@pytest.mark.parametrize("tool,args,method,params", [
+    ("send_message", {"to": "a@s.whatsapp.net", "text": "hi"},
+     "sendMessage", {"to": "a@s.whatsapp.net", "text": "hi"}),
+    ("send_message", {"to": "a@s.whatsapp.net", "text": "hi", "mentions": ["b@s"]},
+     "sendMessage", {"to": "a@s.whatsapp.net", "text": "hi", "mentions": ["b@s"]}),
+    ("send_reaction", {"key": {"id": "K1"}, "text": "\U0001f600"},
+     "sendReaction", {"key": {"id": "K1"}, "text": "\U0001f600"}),
+    ("mark_read", {"chat": "c@s.whatsapp.net", "ids": ["m1", "m2"]},
+     "readMessages", {"chat": "c@s.whatsapp.net", "ids": ["m1", "m2"]}),
+    ("send_media", {"to": "a@s.whatsapp.net", "kind": "image",
+                    "url": "https://x/i.png", "mimetype": "image/png"},
+     "sendMediaMessage", {"to": "a@s.whatsapp.net", "kind": "image",
+                          "url": "https://x/i.png", "mimetype": "image/png"}),
+    ("send_presence", {"presence": "typing", "to": "a@s.whatsapp.net"},
+     "sendPresenceUpdate", {"presence": "typing", "to": "a@s.whatsapp.net"}),
+    ("is_on_whatsapp", {"phones": ["+5511999999999"]},
+     "isOnWhatsApp", {"phones": ["+5511999999999"]}),
+    ("call_method", {"method": "someHypermeowRpc", "params": [1, 2]},
+     "someHypermeowRpc", [1, 2]),
+])
+def test_transport_tool_maps_to_rpc(registry, tool, args, method, params):
+    """Every messaging tool funnels through POST /connections/request with
+    {connectionId, method, params} — the one shape whats2api speaks."""
+    running = registry.enable("whats2api_bridge")
+    running.host.get_settings().set("api_token", "fake")
+    w2a_plugin = _get_loaded_plugin_module()
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"error": False, "result": {"ok": 1}})
+
+    orig = _mock_client(w2a_plugin, handler)
+    try:
+        async def call():
+            return await get_mcp_manager().call_tool(
+                f"mcp__oxs_whats2api_bridge__{tool}",
+                {**args, "connection_id": "CID"},
+            )
+
+        result = asyncio.run(call())
+        assert result["exit_code"] == 0, result
+        assert len(seen) == 1
+        method_name, path, payload = seen[0]
+        assert (method_name, path) == ("POST", "/connections/request")
+        assert payload == {"connectionId": "CID", "method": method, "params": params}
+    finally:
+        w2a_plugin._build_client = orig
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("send_message", {"text": "hi"}),               # missing to
+    ("send_message", {"to": "a@s"}),                 # missing text
+    ("send_reaction", {}),                            # missing key
+    ("mark_read", {"chat": "c@s"}),                  # missing ids
+    ("send_media", {"to": "a@s", "kind": "image"}),  # missing url/mimetype
+    ("is_on_whatsapp", {}),                           # missing phones
+    ("call_method", {}),                              # missing method
+])
+def test_transport_tool_rejects_incomplete_args_without_network(
+    registry, tool, args,
+):
+    """A malformed call must fail on the argument check, not 401 at the wire.
+
+    Reaching the network here means the validation was skipped, and the
+    operator pays for it in upstream rate limit.
+    """
+    running = registry.enable("whats2api_bridge")
+    running.host.get_settings().set("api_token", "fake")
+    w2a_plugin = _get_loaded_plugin_module()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"must not reach the network: {request.url}")
+
+    orig = _mock_client(w2a_plugin, handler)
+    try:
+        async def call():
+            return await get_mcp_manager().call_tool(
+                f"mcp__oxs_whats2api_bridge__{tool}",
+                {**args, "connection_id": "CID"},
+            )
+
+        result = asyncio.run(call())
+        assert result["exit_code"] == 1
+        assert "ok" not in result
+        assert result["error"]
+    finally:
+        w2a_plugin._build_client = orig
+
+
+@pytest.mark.parametrize("tool,method,path,expected", [
+    ("list_connections", "GET", "/connections", None),
+    ("refresh_connections", "GET", "/connections", None),
+    ("get_connection", "GET", "/connections/CID", None),
+    ("start_connection", "POST", "/connections/CID/start", None),
+    ("stop_connection", "POST", "/connections/CID/stop", None),
+    ("remove_connection", "DELETE", "/connections/CID", None),
+    ("create_connection", "POST", "/connections", {"name": "phone"}),
+])
+def test_connection_lifecycle_tool_hits_its_route(
+    registry, tool, method, path, expected,
+):
+    running = registry.enable("whats2api_bridge")
+    running.host.get_settings().set("api_token", "fake")
+    w2a_plugin = _get_loaded_plugin_module()
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content
+        seen.append((request.method, request.url.path,
+                     json.loads(body) if body else None))
+        return httpx.Response(200, json={"_id": "CID", "status": "open"})
+
+    orig = _mock_client(w2a_plugin, handler)
+    try:
+        async def call():
+            return await get_mcp_manager().call_tool(
+                f"mcp__oxs_whats2api_bridge__{tool}",
+                {"connection_id": "CID", "name": "phone"},
+            )
+
+        result = asyncio.run(call())
+        assert result["exit_code"] == 0, result
+        assert len(seen) == 1
+        got_method, got_path, got_body = seen[0]
+        assert got_method == method
+        assert got_path == path
+        if expected is not None:
+            assert got_body == expected
+    finally:
+        w2a_plugin._build_client = orig
+
+
+def test_health_reports_unreachable_without_raising(registry):
+    """health must answer, not explode — an unreachable provider IS the answer."""
+    running = registry.enable("whats2api_bridge")
+    running.host.get_settings().set("api_token", "fake")
+    w2a_plugin = _get_loaded_plugin_module()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    orig = _mock_client(w2a_plugin, handler)
+    try:
+        async def call():
+            return await get_mcp_manager().call_tool(
+                "mcp__oxs_whats2api_bridge__health", {},
+            )
+
+        result = asyncio.run(call())
+        assert result["exit_code"] == 0
+        assert result["output"]["data"]["healthy"] is False
+        assert result["output"]["data"]["connection_count"] == 0
+    finally:
+        w2a_plugin._build_client = orig
+
+
+def test_send_message_fires_the_message_sent_event(registry):
+    """SPEC §5.3: a successful send fires ``whats2api.message.sent``.
+
+    Downstream extensions subscribe to this. A send that silently skips the
+    event looks identical to a send that worked, from their side.
+    """
+    from core.extensions.events import _subscribers as subscribers
+
+    running = registry.enable("whats2api_bridge")
+    running.host.get_settings().set("api_token", "fake")
+    w2a_plugin = _get_loaded_plugin_module()
+    fired: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"error": False, "result": {"key": {"id": "K"}}})
+
+    orig = _mock_client(w2a_plugin, handler)
+    try:
+        # Subscribers are (extension_id, handler) pairs.
+        subscribers["whats2api.message.sent"] = [
+            ("whats2api_bridge", lambda payload: fired.append(payload))
+        ]
+        async def call():
+            return await get_mcp_manager().call_tool(
+                "mcp__oxs_whats2api_bridge__send_message",
+                {"to": "a@s.whatsapp.net", "text": "hi", "connection_id": "CID"},
+            )
+
+        result = asyncio.run(call())
+        assert result["exit_code"] == 0, result
+        assert len(fired) == 1, fired
+        payload = fired[0]
+        assert payload["connection_id"] == "CID"
+        assert payload["to"] == "a@s.whatsapp.net"
+        assert payload["text"] == "hi"
+    finally:
+        subscribers.pop("whats2api.message.sent", None)
+        w2a_plugin._build_client = orig
+
+
+# ── Invariant 1: the analyzer never writes to WhatsApp ──────────────────────
+
+
+def test_analyzer_is_refused_every_transport_tool(registry):
+    """§1's first non-goal, enforced.
+
+    The crew ``enabled_tools`` allowlist inverts over
+    ``BUILTIN_TOOL_DESCRIPTIONS``, which holds no ``mcp__*`` names — so the
+    scheduler force-includes allowlisted MCP tools but never *excludes* the
+    rest. The analyzer's read-only-over-WhatsApp rule therefore cannot be
+    expressed as an allowlist, and the prompt saying "NEVER call
+    send_message" is not enforcement. Each transport handler checks.
+    """
+    from core.database import ScheduledTask as _ST, SessionLocal as _SL
+    from core.database import Session as _Session
+    from src.agent_runtime.authority import RequestAuthority, bind_request_authority
+
+    running = registry.enable("whats2api_bridge")
+    running.host.get_settings().set("api_token", "fake")
+    w2a_plugin = _get_loaded_plugin_module()
+
+    # Give the analyzer task a session, the way the scheduler does.
+    session_id = "analyzer-session-0001"
+    db = _SL()
+    try:
+        db.add(_Session(id=session_id, name="[Task] Conversation Analyzer",
+                         endpoint_url="", model="test-model"))
+        db.add(_ST(id="task-analyzer-0001",
+                   name="[whats2api_bridge] Conversation Analyzer",
+                   session_id=session_id, status="active"))
+        db.commit()
+    finally:
+        db.close()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"analyzer must never reach WhatsApp: {request.url}")
+
+    orig = _mock_client(w2a_plugin, handler)
+    w2a_plugin._ANALYZER_SESSION_IDS = {session_id}   # bypass the TTL cache
+    w2a_plugin._ANALYZER_GUARD_STAMP = time.time()
+    try:
+        async def call(tool):
+            authority = RequestAuthority.empty(
+                owner=None, session_id=session_id, workspace="",
+            )
+            with bind_request_authority(authority):
+                return await get_mcp_manager().call_tool(
+                    f"mcp__oxs_whats2api_bridge__{tool}",
+                    {
+                        "to": "a@s.whatsapp.net", "text": "hi",
+                        "chat": "c@s", "ids": ["m1"],
+                        "key": {"id": "K"}, "phones": ["+55"],
+                        "method": "sendMessage",
+                        "connection_id": "CID", "name": "n",
+                    },
+                )
+
+        for tool in TRANSPORT_TOOLS:
+            result = asyncio.run(call(tool))
+            assert result["exit_code"] == 1, (tool, result)
+            assert "read-only" in result["error"], (tool, result)
+            # The marker is a sibling of "error", not part of the message:
+            # ``_format_in_process_result`` forwards the envelope's extra
+            # keys so a refusal is machine-classifiable.
+            assert result.get("blocked_by") == "analyzer_read_only_policy", (tool, result)
+    finally:
+        w2a_plugin._build_client = orig
+
+
+def test_analyzer_can_still_use_the_read_tools(registry):
+    """The guard must not be a blanket block — the analyzer's whole job is
+    reading intervals and the run dies without these."""
+    from src.agent_runtime.authority import RequestAuthority, bind_request_authority
+
+    running = registry.enable("whats2api_bridge")
+    running.host.get_settings().set("api_token", "fake")
+    w2a_plugin = _get_loaded_plugin_module()
+
+    w2a_plugin._ANALYZER_SESSION_IDS = set()   # not an analyzer session
+    async def call():
+        authority = RequestAuthority.empty(
+            owner=None, session_id="someone-elses-session", workspace="",
+        )
+        with bind_request_authority(authority):
+            return await get_mcp_manager().call_tool(
+                "mcp__oxs_whats2api_bridge__get_analysis_queue", {},
+            )
+
+    result = asyncio.run(call())
+    assert result["exit_code"] == 0, result
+    assert result["output"]["ok"] is True
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

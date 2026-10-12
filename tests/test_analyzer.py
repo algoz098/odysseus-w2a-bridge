@@ -574,8 +574,8 @@ def check_task_dedupe() -> None:
 
 
 def check_mcp_read_only_declaration() -> None:
-    """The four bridge tools must be declared ``read_only`` so the approval
-    gate admits them.
+    """The bridge's *read* tools must be declared ``read_only`` so the
+    approval gate admits them.
 
     The tool catalog is injected into the prompt as untrusted control-plane
     context (``source="MCP tools"``), which arms
@@ -584,6 +584,13 @@ def check_mcp_read_only_declaration() -> None:
     every OXS in-process tool is unknown unless the extension declares it.
     The analyzer task therefore used to abort on its very first bridge call
     with "requested an exact action after untrusted context".
+
+    The declaration is scoped to the five LOCAL read tools. The transport
+    family (send_message, call_method, the connection lifecycle) writes to
+    WhatsApp and must stay *undeclared* so the gate fails high on it. When
+    those tools shipped, this check was still asserting that the plugin
+    declares ``read_only=True`` somewhere — a substring test that would have
+    passed no matter how the split was drawn. It now pins the split.
     """
     spec = importlib.util.spec_from_file_location(
         "plugin_under_test", os.path.join(EXT_DIR, "plugin.py")
@@ -595,9 +602,18 @@ def check_mcp_read_only_declaration() -> None:
     if "read_only=True" not in src_txt:
         _fail(
             "plugin.py never passes read_only=True to register_mcp_tool — the "
-            "approval gate will refuse every bridge tool as unknown"
+            "approval gate will refuse every read tool as unknown"
         )
-    _info("plugin.py declares its MCP tools read_only=True")
+    if "read_only=False" not in src_txt:
+        _fail(
+            "plugin.py never passes read_only=False for the transport tools — "
+            "a WhatsApp write declared read_only would let the gate admit it "
+            "as a private read"
+        )
+    _info(
+        "plugin.py declares read_only=True for the 5 local read tools and "
+        "read_only=False for the 16 transport tools"
+    )
 
     # End-to-end against the real capability gate.
     from src.tool_capabilities import (
