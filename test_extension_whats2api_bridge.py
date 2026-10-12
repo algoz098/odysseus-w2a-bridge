@@ -918,8 +918,6 @@ def test_analyzer_is_refused_every_transport_tool(registry):
         raise AssertionError(f"analyzer must never reach WhatsApp: {request.url}")
 
     orig = _mock_client(w2a_plugin, handler)
-    w2a_plugin._ANALYZER_SESSION_IDS = {session_id}   # bypass the TTL cache
-    w2a_plugin._ANALYZER_GUARD_STAMP = time.time()
     try:
         async def call(tool):
             authority = RequestAuthority.empty(
@@ -958,7 +956,6 @@ def test_analyzer_can_still_use_the_read_tools(registry):
     running.host.get_settings().set("api_token", "fake")
     w2a_plugin = _get_loaded_plugin_module()
 
-    w2a_plugin._ANALYZER_SESSION_IDS = set()   # not an analyzer session
     async def call():
         authority = RequestAuthority.empty(
             owner=None, session_id="someone-elses-session", workspace="",
@@ -971,6 +968,52 @@ def test_analyzer_can_still_use_the_read_tools(registry):
     result = asyncio.run(call())
     assert result["exit_code"] == 0, result
     assert result["output"]["ok"] is True
+
+
+def test_guard_fails_closed_when_the_session_lookup_errors(registry):
+    """Unreadable is not "nobody".
+
+    An empty answer means "no session is the analyzer", i.e. allow every
+    WhatsApp write. If the lookup errors we must refuse instead — the
+    analyzer's own runs never use these tools, so a false refusal only
+    costs a manual retry.
+    """
+    from src.agent_runtime.authority import RequestAuthority, bind_request_authority
+
+    running = registry.enable("whats2api_bridge")
+    running.host.get_settings().set("api_token", "fake")
+    w2a_plugin = _get_loaded_plugin_module()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"must not reach the network: {request.url}")
+
+    orig = _mock_client(w2a_plugin, handler)
+    import core.database as _cdb
+    saved = _cdb.SessionLocal
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("database is down")
+
+    _cdb.SessionLocal = _boom
+    try:
+        async def call():
+            authority = RequestAuthority.empty(
+                owner=None, session_id="anyone-at-all", workspace="",
+            )
+            with bind_request_authority(authority):
+                return await get_mcp_manager().call_tool(
+                    "mcp__oxs_whats2api_bridge__send_message",
+                    {"to": "a@s.whatsapp.net", "text": "hi",
+                     "connection_id": "CID"},
+                )
+
+        result = asyncio.run(call())
+    finally:
+        _cdb.SessionLocal = saved
+        w2a_plugin._build_client = orig
+
+    assert result["exit_code"] == 1, result
+    assert result.get("blocked_by") == "analyzer_lookup_unavailable", result
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
