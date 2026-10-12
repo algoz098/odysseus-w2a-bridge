@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Playwright MCP scratch output (231 console logs / traces, regenerated per run)
+.playwright-mcp/
+
+# macOS
+.DS_Store
+
+# Evidence screenshots from ad-hoc UI runs (after-reload.png, w2a_card_proof.png,
+# session-*.png, chat-*.png). Regenerate when needed; nothing references them.
+*.png
+
+# Stale packaging artifact. Build a fresh one from extensions/ when shipping.
+whats2api_bridge.zip
