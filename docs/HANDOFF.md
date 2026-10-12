@@ -3,9 +3,15 @@
 **Data:** 2026-10-12 (revisão 2)
 **Para:** próxima equipe nesta extension + no core
 **Estado:** ciclo de análise **e** ciclo de transporte validados ponta a ponta
-**Última bateria:** transporte 52/52 ✅ · manifesto/AST/sync ✅ · 30 intervalos ✅
-· 5 soak ✅ · E2E ✅ · restart ✅ · sync repo→container ✅
+**Última bateria:** transporte mock 53 ✅ · **transporte HTTP real 24** ✅ ·
+**inbound real 28** ✅ · manifesto/AST/sync ✅ · 30 intervalos ✅ · 5 soak ✅ ·
+crew-allowlist 5 ✅ · E2E ✅ · restart ✅ · sync repo→container ✅
 
+> **O que ainda não foi provado.** Tudo acima roda contra um *stub* local do
+> `api.whats2api.com` e entregas sintéticas. O transporte nunca falou com o
+> provedor real, e nunca houve tráfego inbound real — a única prova pendente
+> é o token. Ver P0.
+>
 > **Ação do operador pendente.** A suíte antiga escrevia no estado vivo e
 > deixou `api_token: "fake"` e o token do webhook inbound igual a `"token"`
 > (5 caracteres) em `data/oxs/permissions/whats2api_bridge.json`, que é
@@ -350,16 +356,32 @@ esse — é a primeira classe de tráfego real desse formato.
 
 ## 5. O que falta — priorizado
 
-### P0 — Rotacionar as credenciais que a suíte sobrescreveu  ← **bloqueia tráfego real**
+### P0 — Credenciais do provider  ← **única prova que falta**
 
 `data/oxs/permissions/whats2api_bridge.json` (bind-mount, container incluso)
-está com `api_token: "fake"` e `default_connection_id: "DEFAULT_CID"`, e o
-token do webhook inbound em disco é a string `"token"`. Ver A-7.
+está com `api_token: "fake"` e `default_connection_id: "DEFAULT_CID"`. Ver A-7.
 
-**O que fazer:** reintroduzir o token real da API em whats2api.com; apagar
-`data/extensions/whats2api_bridge/inbound_webhook_token` e reabilitar a
-extension para rotacionar o webhook; atualizar a URL em whats2api.com.
-Nenhuma mudança de código faz isso.
+**A rotação do webhook já foi feita e verificada:** apagando o arquivo e
+reabilitando, o token passa a 43 chars URL-safe (32 bytes), é persistido, o
+antigo responde 404 e o novo responde 202. A URL para colar no whats2api.com
+é `POST http://<host>:7011/api/ext/whats2api_bridge/webhook/<token>` com
+`whats2api: true`, `userId` e `connectionId`.
+
+**O que falta:** reintroduzir o token real da API. Sem ele o transporte não
+foi provado contra o provedor — só contra o stub local
+(`test_transport_integration.py`). É o único item que não é código, e nenhuma
+quantidade de suíte verde substitui ele.
+
+**Depois de colocar o token**, o smoke é:
+
+```bash
+python3 - <<'EOF'
+# health -> list_connections -> is_on_whatsapp -> send_message para si mesmo
+EOF
+```
+
+Eu rodo se você mandar o token; enviar mensagem para fora é ação do
+operador, não minha.
 
 ### P1 — ~~Cobertura de transporte~~ **feito**
 
@@ -490,7 +512,9 @@ comportamento de provider real ao longo do tempo. Bloqueado por P0.
 export PYTHONPATH=~/Documents/odysseus          # obrigatório: suítes importam o core
 
 cd ~/Documents/odysseus-w2a
-python3 -m pytest test_extension_whats2api_bridge.py -q  # transporte, 52 checks
+python3 -m pytest test_extension_whats2api_bridge.py -q  # transporte (mock), 53
+python3 -m pytest test_transport_integration.py -q      # transporte (HTTP real), 24
+python3 -u tests/test_inbound_integration.py            # inbound real, 28 checks
 python3 tests/test_analyzer.py                            # manifest, hashes, AST, sync
 python3 tests/test_analyzer_intervals.py                  # 30 checks de fila
 python3 tests/test_analyzer_soak.py                       # 5 checks, relógio virtual
