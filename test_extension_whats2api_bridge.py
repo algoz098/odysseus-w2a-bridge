@@ -26,8 +26,11 @@ import httpx
 import pytest
 
 # Make sure the bundled extension is on the discovery path.
+# This module lives at the repo root, so one dirname gets to the root; the
+# extra one it used to take pointed at ~/Documents and broke every check that
+# opens a file under EXT_DIR.
 EXT_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.abspath(__file__)),
     "extensions",
     "whats2api_bridge",
 )
