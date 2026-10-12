@@ -7,10 +7,18 @@
 **inbound real 28** ✅ · manifesto/AST/sync ✅ · 30 intervalos ✅ · 5 soak ✅ ·
 crew-allowlist 5 ✅ · E2E ✅ · restart ✅ · sync repo→container ✅
 
-> **O que ainda não foi provado.** Tudo acima roda contra um *stub* local do
-> `api.whats2api.com` e entregas sintéticas. O transporte nunca falou com o
-> provedor real, e nunca houve tráfego inbound real — a única prova pendente
-> é o token. Ver P0.
+> **Verificado contra o provedor real (2026-10-12).** `health`,
+> `list_connections`, `is_on_whatsapp`, `call_method` (GetJoinedGroups) e um
+> `send_message` de verdade — id `3EB031AA875C13D6DEAEA0`, engine `hypermeow`.
+> Isso expôs quatro erros de contrato que nenhuma suite mockada pegaria:
+> `params` é array posicional, o corpo é protojson `waE2E.Message`, os dois
+> engines usam nomes de método diferentes, e `/connections` é envelope
+> paginado. Ver §10.
+>
+> **O que ainda não foi provado:** nenhum evento inbound **real** chegou. A
+> webhook configurada no painel do provider aponta para
+> `http://192.168.1.164:7011` — IP de LAN. Se o whats2api for hospedado, ele
+> não alcança isso. Ver P0.
 >
 > **Ação do operador pendente.** A suíte antiga escrevia no estado vivo e
 > deixou `api_token: "fake"` e o token do webhook inbound igual a `"token"`
@@ -557,3 +565,89 @@ propósito, mas o cache do navegador não.
 | Estado vivo | `docs/STATUS.md` |
 | Handoff anterior (findings 1–7) | `docs/odysseus-core-handoff.md` |
 | Isolar testes do estado vivo | `conftest.py` · `W2A_TEST_LIVE_STATE=1` é o opt-out |
+---
+
+## 10. O contrato real do whats2api (aprendido com credencial, não na doc)
+
+Tudo aqui veio de rejeições do `api.whats2api.com`. Um stub escrito a partir
+da documentação pública erra em quatro coisas, e a doc é ambígua justamente
+onde o provider é rigoroso.
+
+### 10.1 Duas credenciais, não uma
+
+| Credencial | Onde funciona |
+|---|---|
+| **Token MCP** (dashboard → `/p/mcp-tokens`) | `/mcp/<token>`; válido, mas **não** na REST |
+| **JWT diário** (`POST /authentication`, email+senha) | `GET /connections`, `POST /connections/request` |
+
+O token MCP na REST dá
+`401 {"message":"jwt malformed","className":"JsonWebTokenError"}` — ele é
+64 hex sem os dois pontos que um JWT tem. O `api_token` da extension agora
+é *fallback*; o caminho principal é `api_email` + `api_password`, com
+re-mint e **um** retry quando a REST devolve 401.
+
+### 10.2 `params` é array posicional
+
+```
+POST /connections/request
+{"connectionId": "...", "method": "SendMessage",
+ "params": ["<jid>@s.whatsapp.net", {"extendedTextMessage": {"text": "..."}}]}
+```
+
+Objeto é recusado com `"/params" ... must be array`. E o layout é
+**posicional e por método** — `SendMessage` é `[jid, message]`, `MarkRead` é
+`[{chat, ids}]`, `IsOnWhatsApp` é `["<phone>", ...]` (uma string por número;
+`{"phones": [...]}` e `[[...]]` são recusados).
+
+### 10.3 O corpo é `waE2E.Message` protojson
+
+`{"text": "..."}` → `proto: unknown field "text"`. O texto vive em
+`extendedTextMessage.text`, e `contextInfo` (citação, menção) dentro dele.
+`{"conversation": "..."}` também valida e é a forma simples legada, mas não
+carrega citação.
+
+### 10.4 Os engines não compartilham nomes
+
+A conexão é `engine: hypermeow` e responde
+`method not on whatsmeow client: onWhatsApp` para a grafia Baileys.
+
+| Intenção | baileys | hypermeow |
+|---|---|---|
+| texto | `sendMessage` `[jid, {text}]` | `SendMessage` `[jid, {extendedTextMessage:{text}}]` |
+| reação | `sendMessage` `[jid, {react:{text,key}}]` | `SendMessage` `[jid, {reactionMessage:{…}}]` |
+| marcar lida | `readMessages` `[chat, ids]` | `MarkRead` `[{chat, ids}]` |
+| presença | `sendPresenceUpdate` `[presence]` | `SendPresence` `[presence]` |
+| no WhatsApp | `onWhatsApp` `["jid", …]` | `IsOnWhatsApp` `["jid", …]` |
+
+O engine é lido do documento da conexão e memoizado por 1 min.
+
+### 10.5 `/connections` é envelope paginado
+
+whats2api é Feathers: `{"total": n, "limit": 10, "skip": 0, "data": [...]}`.
+Assumir lista fazia `health` reportar `connection_count: 0` na conta real
+**parecendo saudável**.
+
+### 10.6 O que o provider recusou, e por quê importa
+
+- `send_media` em hypermeow exige `fileLength` (bytes da mídia). Não é
+  derivável, então a tool **recusa** em vez de mandar algo que vai falhar.
+- `MarkRead` no path hypermeow pede `params` array e ao mesmo tempo tenta
+  deserializar o array como struct — nenhuma forma testada passou. Não
+  documentado como quebrado, apenas como não verificado.
+- `SendPresence` com `[presence]` tem o shape certo e devolve
+  `500 fetch failed` — falha interna do provider, não da extension.
+
+---
+
+## 11. Estado da credencial e do webhook
+
+- `.env` (git-ignored, 0600) tem `WHATS2API_EMAIL` / `WHATS2API_PASSWORD`.
+  `tests/load_credentials.py` carrega nos settings sem passar a senha por
+  shell. **Nunca commitar.**
+- Token do webhook: `"1"`, por decisão do operador. Persiste por
+  `_apply_url_token`, que grava o pin em disco — verificado através de
+  `docker restart` **e** disable/enable.
+- URL: `http://192.168.1.164:7011/api/ext/whats2api_bridge/webhook/1`
+- **Bloqueio para inbound real:** `192.168.1.164` é LAN privada. Um
+  whats2api hospedado não alcança. Precisa de túnel (cloudflared/ngrok) ou
+  de uma porta pública — nenhuma das duas é código, é decisão de rede.
