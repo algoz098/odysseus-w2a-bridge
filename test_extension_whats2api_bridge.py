@@ -68,17 +68,41 @@ from core.extensions.storage import PluginStorage
 from src.mcp_manager import get_mcp_manager
 
 
+# Operator-settable keys this suite writes. They are persisted to disk on
+# every set() by design, so they also persist between tests in a session —
+# and a leaked ``default_connection_id`` makes a later test pass or fail
+# for the wrong reason. (It reported two product bugs that did not exist
+# when test_transport_integration.py was first written.)
+_VOLATILE_SETTINGS = (
+    "api_token", "default_connection_id", "webhook_url_token",
+    "inbound_webhook_key", "base_url", "request_timeout_seconds",
+    "analyzer_adopt_existing",
+)
+
+
+def _clear_settings() -> None:
+    from core.extensions.host import SettingsNamespace
+    ns = SettingsNamespace("whats2api_bridge")
+    for key in _VOLATILE_SETTINGS:
+        try:
+            ns.set(key, None)
+        except Exception:
+            pass
+
+
 @pytest.fixture(autouse=True)
 def _reset_state():
     """Reset OXS singletons between tests so state doesn't leak."""
     oxs_webhooks.reset_for_tests()
     oxs_webhooks.reset_rate_limits()
     _event_subscribers.clear()
+    _clear_settings()
     init_db()
     yield
     oxs_webhooks.reset_for_tests()
     oxs_webhooks.reset_rate_limits()
     _event_subscribers.clear()
+    _clear_settings()
 
 
 @pytest.fixture
