@@ -293,18 +293,43 @@ DISCLOSURE_ONLY = (
 )
 
 
-def test_disclosure_only_success_releases_claim_instead_of_sealing_it():
-    """A run that only emitted the effect disclosure never read the interval.
+def test_run_that_never_read_the_queue_releases_its_claim():
+    """The A-1 case, and the one that still matters: nothing engaged.
 
-    ``status == success`` used to be the whole seal condition, so a model that
-    answered from the prompt without calling the queue — or whose answer was
-    replaced by the disclosure — sealed the interval for good. Its promises
-    never became findings and no later run saw the content again.
+    ``status == success`` used to be the whole seal condition, so a model
+    that answered from the prompt without calling the queue sealed the
+    interval for good. Its promises never became findings and no later run
+    saw the content again. No disclosure, no prose — nothing proves the
+    interval was ever read, so it goes back in the queue.
+    """
+    d = mod.seal_claims([_claim()], [_run(result="")], now=NOW)
+    if len(d["release"]) != 1 or d["seal"] or d["keep"]:
+        _fail(f"a run that never read the queue must release: {d}")
+    _info("a run with no evidence of reading the queue releases its claim")
+
+
+def test_disclosure_only_run_seals_rather_than_duplicating():
+    """CHANGED DELIBERATELY. Prose is not evidence of work.
+
+    This used to require a release. A live run on a real WhatsApp message
+    ("Aman�� vamo tomar sorvete") wrote a note AND a calendar event, then
+    finished with six empty rounds — result was the disclosure and nothing
+    else. Judged on prose that looks identical to "did nothing", so the
+    claim was released, and every following run re-analysed the same
+    interval and wrote the same note and event again.
+
+    Both states are observationally identical in the run record and there is
+    no tool-execution table to tell them apart, so the tie breaks towards
+    sealing: duplicates are visible and deletable, a silently dropped
+    conversation is neither, and the retry loop makes duplication certain
+    rather than possible.
+
+    What this gives up is documented in _run_produced_an_answer.
     """
     d = mod.seal_claims([_claim()], [_run(result=DISCLOSURE_ONLY)], now=NOW)
-    if len(d["release"]) != 1 or d["seal"] or d["keep"]:
-        _fail(f"disclosure-only run must release, not seal: {d}")
-    _info("success that only emitted the effect disclosure releases its claim")
+    if len(d["seal"]) != 1 or d["release"] or d["keep"]:
+        _fail(f"a run that read the queue must seal, to avoid duplicating: {d}")
+    _info("a disclosure-only run seals (the work may have been done silently)")
 
 
 def test_empty_result_releases_claim():
@@ -563,7 +588,8 @@ ALL_TESTS = [
     test_interval_id_stable,
     test_success_run_seals_claim_with_summary,
     test_failed_run_releases_claim,
-    test_disclosure_only_success_releases_claim_instead_of_sealing_it,
+    test_run_that_never_read_the_queue_releases_its_claim,
+    test_disclosure_only_run_seals_rather_than_duplicating,
     test_empty_result_releases_claim,
     test_real_answer_next_to_the_disclosure_still_seals,
     test_aborted_run_releases_claim,
