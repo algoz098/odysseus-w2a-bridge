@@ -369,9 +369,10 @@ de que os tools existiam e só faltava rede de segurança — ver A-5.
 
 ### P2 — ~~Check repo→container~~ **feito** · `tests/test_deploy_sync.py`
 
-O core não é bind-mount; `src/` é embutido na imagem e o deploy é
-`docker cp` + `restart`. Já aconteceu duas vezes nesta sessão. Agora há um
-check automático de hash nos dois hops que existem (w2a → core checkout → container),
+O core não é bind-mount: `src/` é embutido na imagem e o deploy Historically
+era `docker cp` + `restart`. Já aconteceu duas vezes nesta sessão de o
+container rodar código velho. Agora há um check automático de hash nos
+**três** hops que existem (w2a → core checkout → cópia instalada → container),
 cobre os `file_hashes` do manifesto, e faz o deploy com `--deploy`.
 
 ```bash
@@ -379,6 +380,30 @@ python3 tests/test_deploy_sync.py                  # reporta
 python3 tests/test_deploy_sync.py --rehash         # recalcula file_hashes
 python3 tests/test_deploy_sync.py --rehash --deploy # sincroniza e restarta
 ```
+
+### P2b — Deploy agora é *build*, não *copy*  ← **muda o fluxo**
+
+O jeito certo de subir mudança no core é rebuildar a imagem, porque é o que
+elimina a categoria inteira de bug do P2 — nada mais depende de alguém
+lembrar de `docker cp`:
+
+```bash
+cd ~/Documents/odysseus
+docker compose build odysseus          # src/ e extensions/ entram via COPY . .
+docker compose up -d odysseus          # recria o container
+```
+
+A extensão entra junto: `extensions/` **não** está no `.dockerignore`, então a
+w2a bridge já vai embutida. `ODYSSEUS_IMAGE=odysseus-local:dev` no `.env`.
+
+`--deploy` do `test_deploy_sync.py` continua sendo o atalho para mudança só de
+extension — é mais rápido que rebuild e não toca no resto da imagem. Mas para
+mudança em `src/`, build.
+
+> **Atenção ao disco:** a imagem tem ~3,6 GB e a máquina estava com 3,6 GB
+> livres. O build incremental só invalida de `COPY . .` em diante, então
+> cacheado é barato — mas uma build do zero não cabe. `docker builder prune`
+> libera ~4,8 GB se precisar.
 
 ### P3 — ~~Teste de restart~~ **feito** · `tests/test_restart.py`
 
@@ -389,14 +414,16 @@ dele mesmo), `plugin.py` inalterado, storage legível.
 
 ### P4 — Levar os fixes de core para upstream
 
-C-1 a C-10 estão em `src/` no branch `dev` e afetam **qualquer** usuário do
-Odysseus, não só esta extension. Ficarem aqui é conhecimento perdido.
-Documentados em `docs/odysseus-core-handoff.md` para o time de core.
+C-1 a C-10 estão em `dev` e afetam **qualquer** usuário do Odysseus, não só
+esta extension. Ficarem aqui é conhecimento perdido.
 
-**C-8 precisa de decisão, não só de port.** Fechar a metade que falta do
-`disabled_tools` muda a semântica de todo crew com `enabled_tools`. Enquanto
-não houver decisão, a extension se defende sozinha — mas isso é defesa em
-profundidade, não a correção.
+**O C-8 foi corrigido no core e é a mudança com mais chance de tocar outros
+usuários** — todo crew com `enabled_tools` que nomeie alguma tool `mcp__*`
+passa a ter o resto bloqueado. Foi feito assim deliberadamente: a inversão só
+ativa para quem **declara** tools MCP, então crew nativo-only fica intocado.
+Ainda assim é mudança de semântica e quer uma revisão do time de core.
+
+Documentado em `docs/odysseus-core-handoff.md` (addendum: findings 5, 6, 7).
 
 ### P5 — Soak em tempo real
 
@@ -430,7 +457,10 @@ comportamento de provider real ao longo do tempo. Bloqueado por P0.
 1. **SQLite do container: nunca abrir por fora.** Já trunca dados. Ver C-7.
 2. **OXS faz AST audit no enable.** Uma chamada proibida no plugin = extensão
    morta, sem erro visível. `test_analyzer.py` roda o scanner do framework.
-3. **Core não é bind-mount.** `docker cp` + `restart`, sempre. Ver P2.
+3. **Core não é bind-mount.** `restart` **não** é deploy. Subir mudança em
+   `src/` é rebuildar a imagem (`docker compose build odysseus && up -d`).
+   O atalho `docker cp` + `restart` do `test_deploy_sync.py --deploy` serve
+   para mudança só de extension. Ver P2/P2b.
 4. **Três cópias da extension, e a discovery nem sempre escolhe a que você
    editou.** `odysseus-w2a/extensions/…` (dev), `odysseus/extensions/…`
    (bundled, tem prioridade na discovery) e
@@ -469,7 +499,14 @@ python3 -u tests/test_restart.py                          # durabilidade de rest
 python3 tests/test_deploy_sync.py                         # drift repo → container
 ```
 
-**Deploy:**
+**Deploy de mudança no core (o jeito certo):**
+
+```bash
+cd ~/Documents/odysseus
+docker compose build odysseus && docker compose up -d odysseus
+```
+
+**Deploy de mudança só na extension (atalho):**
 
 ```bash
 cd ~/Documents/odysseus-w2a
