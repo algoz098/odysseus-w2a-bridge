@@ -707,29 +707,37 @@ def _mock_client(w2a_plugin, handler):
     return orig
 
 
+# `params` is a positional ARRAY the provider validates per engine, and the
+# layout differs between baileys and hypermeow. These expectations were
+# learned from the live API, which rejected the previous (object-shaped,
+# Baileys-spelled) version of every one of them.
 @pytest.mark.parametrize("tool,args,method,params", [
     ("send_message", {"to": "a@s.whatsapp.net", "text": "hi"},
-     "sendMessage", {"to": "a@s.whatsapp.net", "text": "hi"}),
-    ("send_message", {"to": "a@s.whatsapp.net", "text": "hi", "mentions": ["b@s"]},
-     "sendMessage", {"to": "a@s.whatsapp.net", "text": "hi", "mentions": ["b@s"]}),
-    ("send_reaction", {"key": {"id": "K1"}, "text": "\U0001f600"},
-     "sendReaction", {"key": {"id": "K1"}, "text": "\U0001f600"}),
+     "sendMessage", ["a@s.whatsapp.net", {"text": "hi"}]),
+    ("send_message", {"to": "a@s.whatsapp.net", "text": "hi",
+                      "mentions": ["b@s"]},
+     "sendMessage", ["a@s.whatsapp.net", {"text": "hi"},
+                     {"mentions": ["b@s"]}]),
+    ("send_reaction", {"key": {"id": "K1", "remoteJid": "c@s"},
+                       "text": "\U0001f600"},
+     "sendMessage", ["c@s", {"react": {"text": "\U0001f600",
+                                       "key": {"id": "K1",
+                                               "remoteJid": "c@s"}}}]),
     ("mark_read", {"chat": "c@s.whatsapp.net", "ids": ["m1", "m2"]},
-     "readMessages", {"chat": "c@s.whatsapp.net", "ids": ["m1", "m2"]}),
-    ("send_media", {"to": "a@s.whatsapp.net", "kind": "image",
-                    "url": "https://x/i.png", "mimetype": "image/png"},
-     "sendMediaMessage", {"to": "a@s.whatsapp.net", "kind": "image",
-                          "url": "https://x/i.png", "mimetype": "image/png"}),
-    ("send_presence", {"presence": "typing", "to": "a@s.whatsapp.net"},
-     "sendPresenceUpdate", {"presence": "typing", "to": "a@s.whatsapp.net"}),
+     "readMessages", ["c@s.whatsapp.net", ["m1", "m2"]]),
+    ("send_media", {"to": "a@s", "kind": "image", "url": "https://x/i.png",
+                    "mimetype": "image/png"},
+     "sendMessage", ["a@s", {"image": {"url": "https://x/i.png",
+                                       "mimetype": "image/png"}}]),
+    ("send_presence", {"presence": "typing"},
+     "sendPresenceUpdate", ["typing"]),
     ("is_on_whatsapp", {"phones": ["+5511999999999"]},
-     "isOnWhatsApp", {"phones": ["+5511999999999"]}),
-    ("call_method", {"method": "someHypermeowRpc", "params": [1, 2]},
-     "someHypermeowRpc", [1, 2]),
+     "onWhatsApp", ["+5511999999999"]),
+    ("call_method", {"method": "someRpc", "params": [1, 2]},
+     "someRpc", [1, 2]),
 ])
 def test_transport_tool_maps_to_rpc(registry, tool, args, method, params):
-    """Every messaging tool funnels through POST /connections/request with
-    {connectionId, method, params} — the one shape whats2api speaks."""
+    """Every messaging tool funnels through POST /connections/request."""
     running = registry.enable("whats2api_bridge")
     running.host.get_settings().set("api_token", "fake")
     w2a_plugin = _get_loaded_plugin_module()
@@ -758,11 +766,11 @@ def test_transport_tool_maps_to_rpc(registry, tool, args, method, params):
 
 
 @pytest.mark.parametrize("tool,args", [
-    ("send_message", {"text": "hi"}),               # missing to
-    ("send_message", {"to": "a@s"}),                 # missing text
+    ("send_message", {"text": "hi"}),                # missing to
+    ("send_message", {"to": "a@s"}),                  # missing text
     ("send_reaction", {}),                            # missing key
-    ("mark_read", {"chat": "c@s"}),                  # missing ids
-    ("send_media", {"to": "a@s", "kind": "image"}),  # missing url/mimetype
+    ("mark_read", {"chat": "c@s"}),                   # missing ids
+    ("send_media", {"to": "a@s", "kind": "image"}),   # missing url/mimetype
     ("is_on_whatsapp", {}),                           # missing phones
     ("call_method", {}),                              # missing method
 ])

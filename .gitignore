@@ -16,3 +16,11 @@ __pycache__/
 
 # Stale packaging artifact. Build a fresh one from extensions/ when shipping.
 whats2api_bridge.zip
+
+# Secrets. The whats2api account password lives in `.env` (see
+# tests/load_credentials.py); it must never be committed. Mirrors the core
+# repo's rule, which this repo was missing.
+.env
+.env.bak.*
+.env.*
+!.env.example

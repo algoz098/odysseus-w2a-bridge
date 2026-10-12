@@ -39,12 +39,19 @@ from src.mcp_manager import get_mcp_manager
 
 # ── The provider stub ──────────────────────────────────────────────────────
 
+# The real provider is a Feathers app and answers GET /connections with a
+# paginated envelope, not a bare array. Reproduced here because assuming a
+# bare array silently produced connection_count 0 against the live API.
 CONNECTIONS = [
     {"_id": "CID-1", "name": "phone", "engine": "baileys",
      "phone": "+5511999999999", "status": "open"},
-    {"_id": "CID-2", "name": "tablet", "engine": "whatsmeow",
-     "phone": "", "status": "closed"},
+    {"_id": "CID-2", "name": "tablet", "engine": "hypermeow",
+     "phone": "", "status": "open"},
 ]
+
+
+def paginate(rows: list) -> dict:
+    return {"total": len(rows), "limit": 10, "skip": 0, "data": rows}
 
 
 ACCOUNT_EMAIL = "operator@example.com"
@@ -171,7 +178,7 @@ class _Handler(BaseHTTPRequestHandler):
             action = parts[2] if len(parts) > 2 else None
 
             if method == "GET" and cid is None:
-                self._send(200, self.state.connections)
+                self._send(200, paginate(self.state.connections))
                 return
             if method == "POST" and cid is None:
                 new = {"_id": "CID-NEW", "status": "pending",
@@ -394,21 +401,28 @@ def test_health_reports_the_live_count(bridge, stub):
 # ── Messaging: every one must reach /connections/request ───────────────────
 
 
+# `params` is a POSITIONAL ARRAY the provider validates per engine; an
+# object returns `"/params" must be array`. These expectations are the
+# contract learned from the live API, not guesses.
 @pytest.mark.parametrize("tool,args,method,params", [
     ("send_message", {"to": "a@s.whatsapp.net", "text": "hi"},
-     "sendMessage", {"to": "a@s.whatsapp.net", "text": "hi"}),
-    ("send_reaction", {"key": {"id": "K1"}, "text": "\U0001f600"},
-     "sendReaction", {"key": {"id": "K1"}, "text": "\U0001f600"}),
+     "sendMessage", ["a@s.whatsapp.net", {"text": "hi"}]),
+    ("send_reaction", {"key": {"id": "K1", "remoteJid": "c@s"},
+                       "text": "\U0001f600"},
+     "sendMessage", ["c@s", {"react": {"text": "\U0001f600",
+                                       "key": {"id": "K1",
+                                               "remoteJid": "c@s"}}}]),
     ("mark_read", {"chat": "c@s.whatsapp.net", "ids": ["m1", "m2"]},
-     "readMessages", {"chat": "c@s.whatsapp.net", "ids": ["m1", "m2"]}),
+     "readMessages", ["c@s.whatsapp.net", ["m1", "m2"]]),
     ("send_media", {"to": "a@s", "kind": "image", "url": "https://x/i.png",
                     "mimetype": "image/png", "caption": "look"},
-     "sendMediaMessage", {"to": "a@s", "kind": "image", "url": "https://x/i.png",
-                          "mimetype": "image/png", "caption": "look"}),
+     "sendMessage", ["a@s", {"image": {"url": "https://x/i.png",
+                                       "mimetype": "image/png",
+                                       "caption": "look"}}]),
     ("send_presence", {"presence": "typing"},
-     "sendPresenceUpdate", {"presence": "typing"}),
-    ("is_on_whatsapp", {"phones": ["+5511999999999"]},
-     "isOnWhatsApp", {"phones": ["+5511999999999"]}),
+     "sendPresenceUpdate", ["typing"]),
+    ("is_on_whatsapp", {"phones": ["+5511999999999", "+5511888888888"]},
+     "onWhatsApp", ["+5511999999999", "+5511888888888"]),
     ("call_method", {"method": "fetchProfile", "params": ["x@s"]},
      "fetchProfile", ["x@s"]),
 ])
@@ -422,6 +436,7 @@ def test_messaging_tool_round_trip(bridge, stub, tool, args, method, params):
     assert req["body"] == {
         "connectionId": "CID-1", "method": method, "params": params,
     }
+    assert isinstance(req["body"]["params"], list), "params must be an array"
     # The upstream result must survive the envelope intact.
     assert result["output"]["data"]["result"]["messageId"] == "BAILEYS-ID-1"
 
@@ -545,3 +560,117 @@ def test_client_timeout_is_honoured(bridge, stub):
     assert result["exit_code"] == 1
     assert ("network error" in result["error"].lower()
             or "timeout" in str(result).lower()), result
+
+# ── hypermeow (whatsmeow) — the engine the live connection actually uses ───
+# The method reference is explicit that the two engines do not share names,
+# and that hypermeow speaks waE2E protojson. The first version of the
+# transport tools hardcoded Baileys spellings, which would have failed at
+# the WhatsApp server rather than here.
+
+
+HYPER = "CID-2"          # engine: hypermeow in the stub
+
+
+def _last_rpc(stub):
+    for req in reversed(stub.requests):
+        if req["path"] == "/connections/request":
+            return req["body"]
+    raise AssertionError("no /connections/request call was made")
+
+
+def test_engine_is_read_from_the_connection_document(bridge, stub):
+    assert call("list_connections", {})["exit_code"] == 0
+    result = call("health")
+    assert result["exit_code"] == 0, result
+    engines = {c["id"]: c["engine"] for c in result["output"]["data"]["connections"]}
+    assert engines == {"CID-1": "baileys", "CID-2": "hypermeow"}, engines
+
+
+def test_list_connections_unwraps_the_paginated_envelope(bridge, stub):
+    """whats2api is a Feathers app: GET /connections is {total,limit,skip,data}.
+
+    Assuming a bare list made ``health`` report connection_count 0 and
+    ``list_connections`` return an unreadable object, on the live API.
+    """
+    result = call("list_connections")
+    assert result["exit_code"] == 0, result
+    data = result["output"]["data"]
+    assert isinstance(data, list), data
+    assert len(data) == 2
+
+
+def test_health_counts_through_the_envelope(bridge, stub):
+    result = call("health")
+    assert result["output"]["data"]["connection_count"] == 2
+
+
+@pytest.mark.parametrize("tool,args,method", [
+    ("send_message", {"to": "a@s", "text": "hi"}, "SendMessage"),
+    ("send_reaction", {"key": {"id": "K1", "remoteJid": "c@s"}, "text": "x"},
+     "SendMessage"),
+    ("mark_read", {"chat": "c@s", "ids": ["m1"]}, "MarkRead"),
+    ("send_presence", {"presence": "typing"}, "SendPresence"),
+    ("is_on_whatsapp", {"phones": ["+5511999999999"]}, "IsOnWhatsApp"),
+])
+def test_hypermeow_uses_its_own_method_names(bridge, stub, tool, args, method):
+    result = call(tool, {**args, "connection_id": HYPER})
+    assert result["exit_code"] == 0, result
+    assert _last_rpc(stub)["method"] == method
+
+
+def test_hypermeow_reaction_is_its_own_message_kind(bridge, stub):
+    """protojson: a reaction is a reactionMessage, not a bare {text, key}."""
+    call("send_reaction", {"key": {"id": "K1", "remoteJid": "c@s"},
+                           "text": "\U0001f600", "connection_id": HYPER})
+    params = _last_rpc(stub)["params"]
+    assert params == ["c@s", {"reactionMessage": {
+        "text": "\U0001f600", "key": {"id": "K1", "remoteJid": "c@s"}}}]
+
+
+def test_hypermeow_quote_and_mention_live_in_context_info(bridge, stub):
+    call("send_message", {"to": "a@s", "text": "hi",
+                          "quoted": {"id": "K1"},
+                          "mentions": ["b@s"],
+                          "connection_id": HYPER})
+    jid, message = _last_rpc(stub)["params"]
+    assert jid == "a@s"
+    # waE2E.Message protojson: a bare {"text": ...} is rejected by the
+    # provider with `proto: unknown field "text"`.
+    extended = message["extendedTextMessage"]
+    assert extended["text"] == "hi"
+    assert extended["contextInfo"]["quotedMessage"] == {"id": "K1"}
+    assert extended["contextInfo"]["mentionedJid"] == ["b@s"]
+
+
+def test_hypermeow_media_requires_file_length(bridge, stub):
+    """whatsmeow rejects the send without fileLength, and it cannot be guessed."""
+    result = call("send_media", {"to": "a@s", "kind": "image",
+                                 "url": "https://x/i.png",
+                                 "mimetype": "image/png",
+                                 "connection_id": HYPER})
+    assert result["exit_code"] == 1
+    assert "file_length" in result["error"], result
+
+
+def test_hypermeow_media_nests_under_its_protojson_field(bridge, stub):
+    result = call("send_media", {"to": "a@s", "kind": "image",
+                                 "url": "https://x/i.png",
+                                 "mimetype": "image/png", "caption": "hi",
+                                 "file_length": 2048,
+                                 "connection_id": HYPER})
+    assert result["exit_code"] == 0, result
+    jid, message = _last_rpc(stub)["params"]
+    assert jid == "a@s"
+    assert message["imageMessage"] == {"url": "https://x/i.png",
+                                       "mimetype": "image/png",
+                                       "fileLength": 2048,
+                                       "caption": "hi"}
+
+
+def test_baileys_and_hypermeow_differ_on_the_same_tool(bridge, stub):
+    call("send_message", {"to": "a@s", "text": "hi", "connection_id": "CID-1"})
+    baileys = _last_rpc(stub)
+    call("send_message", {"to": "a@s", "text": "hi", "connection_id": HYPER})
+    hypermeow = _last_rpc(stub)
+    assert baileys["method"] == "sendMessage"
+    assert hypermeow["method"] == "SendMessage"
